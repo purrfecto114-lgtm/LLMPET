@@ -20,6 +20,7 @@ const MASCOT_EYES = {
   talking: 'mascot-happy.png',
   waiting: 'mascot-wait.png', // 等你处理：瞪大
   needsinput: 'mascot-think.png', // 等你回复：往上看(期待)
+  attention: 'mascot-wait.png', // #attention-event: 一轮完成的短暂态，复用"瞪大"眼神
   error: 'mascot-wait.png',
   // 情绪短暂态 → 就近回落（专属图未画）
   loved: 'mascot-happy.png',
@@ -1064,6 +1065,17 @@ window.pet.onEvent((ev) => {
       transient('happy', 2200, `🎉 大任务搞定！(${ev.ops || ''}步)`, 3800);
       confetti();
       SOUND.bigDone();
+      break;
+    case 'attention':
+      // #attention-event: Stop 完成时补的 1.6s 短暂态，让 cat-attention.gif
+      //（"从工位起身够手机看消息"）有显示窗口。完成后由 applyStats 接管回 idle。
+      // 不与 turn-done/big-done 冲突：那些是 happy 1.8s/2.2s，attention 1.6s
+      // 更早结束；但 transientUntil 是单值，后到者覆盖——按 out.push 顺序，
+      // attention 在 turn-done 之后压栈，但 transient() 只更新 transientState
+      // 和 transientUntil，所以最终态以最后一个 transient 为准。
+      // 实测顺序：turn-done(big-done) 先 transient happy，紧接着 attention transient
+      // 覆盖为 attention 态 1.6s，结束后回 happy 的剩余窗口或直接 idle。
+      transient('attention', 1600, `🔔 ${ev.project || ''} 一轮完成`, 2200);
       break;
     case 'error':
       transient('error', 2600, ev.text || '😵 出了点状况，在想办法…', 3000);
