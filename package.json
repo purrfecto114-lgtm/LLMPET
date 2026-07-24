@@ -1,6 +1,6 @@
 {
   "name": "octopus",
-  "version": "0.1.1",
+  "version": "0.1.2-pre",
   "productName": "Octopus",
   "description": "桌面宠物：实时盯 Claude Code 等 coding agent 的状态、消息、授权与花费",
   "main": "main.js",
