@@ -1,7 +1,50 @@
 'use strict';
 
+/**
+ * #p24-fix: IPC contextBridge security surface (audit R19).
+ *
+ * Security contract (enforced by test/preload-contextbridge-security.js):
+ *   - contextIsolation: true  (main.js webPreferences — verified by audit)
+ *   - nodeIntegration:  false
+ *   - sandbox:          true
+ *   - Only `contextBridge.exposeInMainWorld` is used to reach the renderer.
+ *   - The raw `ipcRenderer` / `require` / `electron` objects are NEVER exposed.
+ *   - Every value on the exposed `pet` object is a Function (no primitives or
+ *     nested objects holding privileged handles leak into the main world).
+ *   - The exact set of exposed keys is locked down by the regression test; any
+ *     addition/removal/rename must be a deliberate, reviewed change.
+ *
+ * `subscribe()` is the only place the renderer registers callbacks. It validates
+ * that `cb` is a function before registering, and returns a real unsubscribe
+ * closure (a no-op unsubscribe is returned for non-functions so the renderer
+ * never throws if it passes garbage).
+ *
+ * Channel map (renderer -> main):
+ *   invoke (request/response):  get-config | get-stats | get-win-pos
+ *   send    (fire-and-forget):  open-panel | close-panel | set-mode | set-skin
+ *                               | set-budget | set-currency | toggle-mute
+ *                               | set-providers | territory-run-now
+ *                               | territory-toggle-auto | quit-app | set-win-pos
+ *                               | launch-claude | launch-codewhale
+ *                               | permission-decide | cw-permission-decide
+ *                               | cw-permission-decide-batch | focus-session
+ *                               | primary-action | set-ignore-mouse | pet-tall
+ *                               | pet-big | set-pet-size | set-panel-height
+ *                               | pet-focus | pet-blur | open-log | pet-log
+ *                               | ui-busy | pet-visual-bounds
+ *
+ * Channel map (main -> renderer, via subscribe wrappers):
+ *   pet:event | pet:stats | pet:config | panel:stats | panel:config | panel:price
+ */
+
 const { contextBridge, ipcRenderer } = require('electron');
 
+/**
+ * Register a renderer callback for a main->renderer channel.
+ * @param {string} channel - IPC channel name.
+ * @param {*} cb - Callback invoked with the event payload (data only, event stripped).
+ * @returns {() => void} Unsubscribe function; no-op if `cb` is not a function.
+ */
 function subscribe(channel, cb) {
   if (typeof cb !== 'function') return () => {};
   const listener = (_event, data) => cb(data);

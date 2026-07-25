@@ -38,6 +38,7 @@ const tests = [
   'test/opencode-installhooks-test.js', // #p12: Round 12 — Opencode provider installHooks
   'test/aider-binary-smoke.js',        // #p17: Round 17 — real Aider CLI binary
   'test/aider-installhooks-test.js',   // #p21: Round 18 — Aider notification bridge
+  'test/preload-contextbridge-security.js', // #p24: Round 19 — IPC contextBridge surface audit
 ];
 
 for (const file of tests) {
