@@ -31,6 +31,7 @@ const tests = [
   'test/opencode-provider-smoke.js',    // #r5: Round 5 — OpenCode provider stub
   'test/boot-defer-smoke.js',           // #r7: Round 7 — boot backfill defer
   'test/codewhale-binary-smoke.js',     // #r8: Round 8 — real Codewhale CLI binary
+  'test/multi-provider-binary-smoke.js', // #r9: Round 9 — real codex/opencode/claude binary
 ];
 
 for (const file of tests) {

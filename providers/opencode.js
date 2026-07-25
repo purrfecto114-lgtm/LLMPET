@@ -10,13 +10,27 @@
 // OpenCode (https://opencode.ai, https://github.com/sst/opencode) is SST's
 // terminal-based AI coding agent. Unlike Claude Code / CodeWhale / Codex,
 // OpenCode does NOT use a TOML/JSON hook config — it has a plugin system:
-//   • Config: ~/.config/opencode/opencode.json (JSON) or ~/.opencode/
+//   • Config: ~/.config/opencode/opencode.json (preferred) or opencode.jsonc
 //   • Plugins: JS/TS modules that hook into 25+ lifecycle events
 //     (see https://opencode.ai/docs/plugins)
 //   • Known events: session.created, session.compacted, agent.finished,
 //     tool.call.before, tool.call.after, message.send, message.render, etc.
 //   • MCP (Model Context Protocol) support
 //   • SDK with event streaming for real-time integration
+//
+// ROUND 9 (2026-07-25): Path alignment verified against REAL OpenCode CLI v1.18.5
+//   binary (installed via `npm install -g opencode-ai`). Real CLI behavior:
+//   • `opencode debug paths` reports: config=~/.config/opencode,
+//     data=~/.local/share/opencode, cache=~/.cache/opencode
+//   • Config file discovery order: opencode.json → opencode.jsonc →
+//     .opencode/opencode.json → .opencode/opencode.jsonc
+//   • Real CLI creates opencode.jsonc on first run (with $schema header)
+//   • Real env vars (3 sources: opencode.ai/docs/config, /docs/cli,
+//     computingforgeeks.com cheat sheet):
+//     - OPENCODE_CONFIG (single file path override)
+//     - OPENCODE_CONFIG_DIR (entire config directory override)  ← we use this
+//     - OPENCODE_CONFIG_CONTENT (inline JSON config for CI)
+//   • Previous stub used nonexistent 'OPENCODE_HOME' env var — fixed in #r9-fix
 //
 // This stub validates that the provider abstraction layer can accommodate
 // OpenCode. It mirrors the aider.js / codex.js stub pattern: parseHookStdin
@@ -39,15 +53,42 @@ const { makeNotImplemented } = require('./base');
 const ID = 'opencode';
 
 // OpenCode respects XDG_CONFIG_HOME on Linux; on macOS/Windows it uses
-// ~/.config/opencode (Opencode v0.x). We honor OPENCODE_HOME override
-// for testing / custom installs.
-function resolveDataHome() {
-  if (process.env.OPENCODE_HOME) return process.env.OPENCODE_HOME;
+// ~/.config/opencode (OpenCode v1.x). We honor OPENCODE_CONFIG_DIR override
+// for testing / custom installs (real env var per opencode.ai/docs/config).
+// #r9-fix: previous stub used nonexistent 'OPENCODE_HOME' env var.
+function resolveConfigDir() {
+  if (process.env.OPENCODE_CONFIG_DIR) return process.env.OPENCODE_CONFIG_DIR;
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg) return path.join(xdg, 'opencode');
   return path.join(os.homedir(), '.config', 'opencode');
 }
-const DATA_HOME = resolveDataHome();
+const CONFIG_DIR = resolveConfigDir();
+
+// #r9: Real OpenCode CLI v1.18.5 separates config (XDG_CONFIG_HOME) from
+// runtime data (XDG_DATA_HOME) and cache (XDG_CACHE_HOME). Verified via
+// `opencode debug paths` against real binary. These dirs hold:
+//   • data: opencode.db (SQLite), log/, repos/  — sessions, transcripts
+//   • cache: bin/, models.json                  — model catalog cache
+function resolveRuntimeDataDir() {
+  if (process.env.OPENCODE_DATA_DIR) return process.env.OPENCODE_DATA_DIR;
+  const xdg = process.env.XDG_DATA_HOME;
+  if (xdg) return path.join(xdg, 'opencode');
+  return path.join(os.homedir(), '.local', 'share', 'opencode');
+}
+function resolveRuntimeCacheDir() {
+  if (process.env.OPENCODE_CACHE_DIR) return process.env.OPENCODE_CACHE_DIR;
+  const xdg = process.env.XDG_CACHE_HOME;
+  if (xdg) return path.join(xdg, 'opencode');
+  return path.join(os.homedir(), '.cache', 'opencode');
+}
+const RUNTIME_DATA_DIR = resolveRuntimeDataDir();
+const RUNTIME_CACHE_DIR = resolveRuntimeCacheDir();
+
+// Backward-compat alias: existing tests/code may reference DATA_HOME. Keep it
+// pointing at CONFIG_DIR (where settingsFile lives) so behavior is unchanged
+// for callers that only read config. New code should use CONFIG_DIR or
+// RUNTIME_DATA_DIR explicitly. (#r9)
+const DATA_HOME = CONFIG_DIR;
 
 // Future hook plugin (does not exist yet — installHooks is a no-op stub).
 const HOOK_SCRIPT = path.join(__dirname, '..', 'hook', 'opencode-hook.js');
@@ -178,12 +219,24 @@ const provider = {
   displayName: 'OpenCode',
 
   dirs: {
-    settingsFile: path.join(DATA_HOME, 'opencode.json'),
+    // Primary config file (real CLI checks opencode.json FIRST, then .jsonc).
+    settingsFile: path.join(CONFIG_DIR, 'opencode.json'),
+    // #r9: Real CLI creates opencode.jsonc on first run; both are valid.
+    settingsFileAlt: path.join(CONFIG_DIR, 'opencode.jsonc'),
     settingsFormat: 'json',
+    // #r9: dataHome kept as CONFIG_DIR for backward compat (where settings
+    // live). Use runtimeDataDir for actual session/transcript data.
     dataHome: DATA_HOME,
-    configDir: DATA_HOME,
-    envOverride: 'OPENCODE_HOME',
-    pluginsDir: path.join(DATA_HOME, 'plugins'),
+    configDir: CONFIG_DIR,
+    // #r9-fix: real env var (was 'OPENCODE_HOME' which doesn't exist).
+    // Sources: opencode.ai/docs/config, opencode.ai/docs/cli,
+    // computingforgeeks.com opencode-cli-cheat-sheet.
+    envOverride: 'OPENCODE_CONFIG_DIR',
+    // #r9: real runtime data dir (sessions, opencode.db, logs).
+    runtimeDataDir: RUNTIME_DATA_DIR,
+    // #r9: real cache dir (bin/, models.json).
+    runtimeCacheDir: RUNTIME_CACHE_DIR,
+    pluginsDir: path.join(CONFIG_DIR, 'plugins'),
   },
 
   hookScript: HOOK_SCRIPT,
