@@ -26,6 +26,7 @@ const tests = [
   'test/codewhale-permission-security.js',
   'test/codewhale-hook-security.js',
   'test/codewhale-provider-security.js',
+  'test/aider-provider-smoke.js',
 ];
 
 for (const file of tests) {
