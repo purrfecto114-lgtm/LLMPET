@@ -68,10 +68,10 @@ function ensureTrayIcon() {
       const srcBuf = fs.readFileSync(SRC_HQ_PATH);
       const icoBuf = await pngToIco(srcBuf);
       if (!Buffer.isBuffer(icoBuf) || icoBuf.length < 100) return null;
-      fs.mkdirSync(userDataDir, { recursive: true });
+      fs.mkdirSync(userDataDir, { recursive: true }); // #r10-security: dir created by Electron; no secret here (icon only)
       // Atomic write: tmp + rename.
       const tmp = path.join(userDataDir, `.tray.${process.pid}.${Date.now()}.ico.tmp`);
-      fs.writeFileSync(tmp, icoBuf);
+      fs.writeFileSync(tmp, icoBuf, { mode: 0o600 }); // #r10-security: restrictive mode (defensive)
       fs.renameSync(tmp, icoPath);
       return icoPath;
     } catch {

@@ -40,6 +40,11 @@ function findClaude() {
 
 const posixQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const appleEscape = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+// #r10-security: Windows cmd.exe double-quote escaping. Inside a "..." string,
+// a literal " must be doubled ("") to avoid closing the string early — this
+// prevents command injection if workDir/claude ever contain a " character.
+// (In practice workDir is always os.homedir(), but defensive escaping is cheap.)
+const winQuote = (s) => `"${String(s).replace(/"/g, '""')}"`;
 
 function trySpawn(bin, args, opts) {
   return new Promise((resolve) => {
@@ -66,8 +71,8 @@ function buildCandidates(claude, workDir) {
     // in cmd.exe /c so the alias resolves inside a real shell context.
     // (W3: Windows adaptation — affects both Claude and CodeWhale launch.)
     return [
-      ['cmd.exe', ['/c', 'wt.exe', '--', 'cmd.exe', '/k', `cd /d "${workDir}" && "${claude}"`]],
-      ['cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', `cd /d "${workDir}" && "${claude}"`]],
+      ['cmd.exe', ['/c', 'wt.exe', '--', 'cmd.exe', '/k', `cd /d ${winQuote(workDir)} && ${winQuote(claude)}`]],
+      ['cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', `cd /d ${winQuote(workDir)} && ${winQuote(claude)}`]],
     ];
   }
   const loginShell = process.env.SHELL && path.isAbsolute(process.env.SHELL) ? process.env.SHELL : '/bin/bash';
@@ -90,4 +95,4 @@ async function launchClaude(opts = {}) {
   return { ok: false, message: 'could not open a terminal' };
 }
 
-module.exports = { launchClaude, findClaude, buildCandidates, trySpawn, posixQuote, appleEscape };
+module.exports = { launchClaude, findClaude, buildCandidates, trySpawn, posixQuote, appleEscape, winQuote };

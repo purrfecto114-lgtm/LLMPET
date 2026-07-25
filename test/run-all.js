@@ -33,6 +33,7 @@ const tests = [
   'test/codewhale-binary-smoke.js',     // #r8: Round 8 — real Codewhale CLI binary
   'test/multi-provider-binary-smoke.js', // #r9: Round 9 — real codex/opencode/claude binary
   'test/process-guards-smoke.js',      // #r10: Round 10 — process-level error guards
+  'test/global-security-audit.js',     // #r10-security: Round 10 — global security audit
 ];
 
 for (const file of tests) {
