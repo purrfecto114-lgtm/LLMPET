@@ -107,26 +107,41 @@ function test_parseHookStdin_boundaries() {
   console.log('aider parseHookStdin boundaries: PASS');
 }
 
-// ─── 4. installHooks / uninstallHooks / markerPresent stub 行为 ──────────
+// ─── 4. installHooks / uninstallHooks / markerPresent (#p21 实现) ─────────
 function test_hook_stubs() {
-  // installHooks — returns no-op result (aider hooks not yet implemented)
+  // #p21: installHooks now writes notifications_command to ~/.aider.conf.yml.
+  // Isolate HOME so we don't touch the real ~/.aider.conf.yml.
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'aider-smoke-'));
+  const origHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  process.env.USERPROFILE = tmpHome;
+
+  // installHooks — returns result with added=1
   const inst = provider.installHooks();
   assert.ok(inst, 'installHooks should return result');
-  assert.strictEqual(inst.added, 0, 'installHooks.added should be 0 (stub)');
-  assert.strictEqual(inst.skipped, true, 'installHooks.skipped should be true (stub)');
-  assert.ok(typeof inst.reason === 'string' && inst.reason.length > 0,
-    'installHooks.reason should be non-empty string');
+  assert.ok(inst.added >= 1, `installHooks.added should be >=1 (P21), got ${inst.added}`);
+  assert.ok(inst.configPath, 'installHooks.configPath should be set');
 
-  // uninstallHooks — returns no-op result
+  // markerPresent — true after install
+  assert.strictEqual(provider.markerPresent(), true, 'markerPresent should be true after install');
+
+  // uninstallHooks — removes our line
   const uninst = provider.uninstallHooks();
   assert.ok(uninst, 'uninstallHooks should return result');
-  assert.ok(typeof uninst.reason === 'string' && uninst.reason.length > 0,
-    'uninstallHooks.reason should be non-empty string');
+  assert.ok(uninst.removed >= 1, `uninstallHooks.removed should be >=1, got ${uninst.removed}`);
 
-  // markerPresent — always false (no hooks installed)
-  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false (stub)');
+  // markerPresent — false after uninstall
+  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false after uninstall');
 
-  console.log('aider hook stubs (install/uninstall/marker): PASS');
+  // Cleanup
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  process.env.HOME = origHome;
+  process.env.USERPROFILE = origHome;
+
+  console.log('aider hook installer (install/uninstall/marker, #p21): PASS');
 }
 
 // ─── 5. makeNotImplemented stub 抛 ENOTIMPL ───────────────────────────────

@@ -87,20 +87,24 @@ function parseHookStdin(event, payload) {
   return body;
 }
 
-// ── Hook installer (minimal — just logs, doesn't modify aider config yet) ──
-// A future implementation would add --notification-command to .aider.conf.yml
-// or set up a file-watch bridge. For now it returns a no-op result.
+// ── Hook installer (Round 18, #p21) ─────────────────────────────────────────
+// Writes `notifications_command` to ~/.aider.conf.yml pointing to aider-hook.js.
+// Aider's notification system runs this command (via shell, no args) when the
+// LLM response is ready — gives the pet a "turn_end" trigger.
+// Delegates to backend/aider-hooks.js (merge-safe YAML line manipulation).
 function installHooks() {
-  // TODO: add --notification-command to .aider.conf.yml pointing to aider-hook.js
-  return { added: 0, skipped: true, reason: 'aider hooks not yet implemented (stub provider)' };
+  const aiderHooks = require('../backend/aider-hooks');
+  return aiderHooks.registerHooks();
 }
 
-function uninstallHooks() {
-  return { removed: 0, reason: 'aider hooks not yet implemented (stub provider)' };
+function uninstallHooks(opts) {
+  const aiderHooks = require('../backend/aider-hooks');
+  return aiderHooks.unregisterHooks(opts || {});
 }
 
 function markerPresent() {
-  return false; // No hooks installed yet
+  const aiderHooks = require('../backend/aider-hooks');
+  return aiderHooks.markerPresent();
 }
 
 // ── Provider descriptor ─────────────────────────────────────────────────────
@@ -161,12 +165,12 @@ const provider = {
 
   capabilities: {
     permissionBubble: false,  // aider confirms in-terminal
-    metering: false,          // no hook-based usage data
+    metering: false,          // no usage data passed to notification command
     sessionList: false,       // git-based sessions, not file-based
-    transcriptBubble: false,  // markdown format, not yet parsed
+    transcriptBubble: true,   // #p21: reads .aider.chat.history.md tail
     focus: false,             // no platform-specific focus support
     launch: false,            // TODO: find aider binary and open terminal
-    greetSleep: false,        // no native session_start/session_end events
+    greetSleep: true,         // #p21: notifications_command gives turn_end trigger
   },
 
   installHooks,
