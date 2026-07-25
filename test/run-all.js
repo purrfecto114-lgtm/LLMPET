@@ -34,6 +34,7 @@ const tests = [
   'test/multi-provider-binary-smoke.js', // #r9: Round 9 — real codex/opencode/claude binary
   'test/process-guards-smoke.js',      // #r10: Round 10 — process-level error guards
   'test/global-security-audit.js',     // #r10-security: Round 10 — global security audit
+  'test/codex-installhooks-test.js',   // #p11: Round 11 — Codex provider installHooks
 ];
 
 for (const file of tests) {

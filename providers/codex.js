@@ -143,21 +143,24 @@ function parseHookStdin(event, payload) {
   return body;
 }
 
-// ── Hook installer (stub — does not modify ~/.codex/config.toml yet) ────────
-// A future implementation (P11) would write [[hooks]] entries to config.toml
-// pointing to codex-hook.js. For now it returns a no-op result so the
-// provider can be registered and tested without side effects.
+// ── Hook installer (Round 11, #p11) ─────────────────────────────────────────
+// Writes ~/.codex/hooks.json (referenced from config.toml as `hooks = "./hooks.json"`).
+// Delegates to backend/codex-hooks.js (merge-safe JSON manipulation).
+// Idempotent: re-running installHooks() replaces our entries without touching
+// hooks from other tools.
 function installHooks() {
-  // TODO (P11): write [[hooks]] entries to ~/.codex/config.toml
-  return { added: 0, skipped: true, reason: 'codex hooks not yet implemented (stub provider, Round 5)' };
+  const codexHooks = require('../backend/codex-hooks');
+  return codexHooks.registerHooks();
 }
 
-function uninstallHooks() {
-  return { removed: 0, reason: 'codex hooks not yet implemented (stub provider, Round 5)' };
+function uninstallHooks(opts) {
+  const codexHooks = require('../backend/codex-hooks');
+  return codexHooks.unregisterHooks(opts || {});
 }
 
 function markerPresent() {
-  return false; // No hooks installed yet
+  const codexHooks = require('../backend/codex-hooks');
+  return codexHooks.markerPresent();
 }
 
 // ── Provider descriptor ─────────────────────────────────────────────────────
@@ -218,13 +221,13 @@ const provider = {
   },
 
   capabilities: {
-    permissionBubble: false,  // TBI in P11+
+    permissionBubble: false,  // #p11: hooks installed but permission bridge TBI
     metering: false,          // TBI in P11+
     sessionList: false,       // TBI in P11+
     transcriptBubble: false,  // TBI in P11+
     focus: false,             // TBI
     launch: false,            // TBI: find codex binary and open terminal
-    greetSleep: true,         // session_start/session_end hooks exist
+    greetSleep: true,         // #p11: session_start/session_end hooks installed
   },
 
   installHooks,

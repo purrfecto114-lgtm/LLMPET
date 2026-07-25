@@ -152,26 +152,38 @@ function test_parseHookStdin_special_fields() {
   console.log('codex parseHookStdin special fields: PASS');
 }
 
-// ─── 5. installHooks / uninstallHooks / markerPresent stub 行为 ──────────
+// ─── 5. installHooks / uninstallHooks / markerPresent (#p11 实现) ─────────
 function test_hook_stubs() {
-  // installHooks — returns no-op result (codex hooks not yet implemented)
+  // #p11: installHooks now writes ~/.codex/hooks.json + config.toml reference.
+  // Isolate HOME so we don't touch the real ~/.codex.
+  const fs = require('fs');
+  const os = require('os');
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-smoke-'));
+  const origCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(tmpHome, '.codex');
+
+  // installHooks — returns result with added count
   const inst = provider.installHooks();
   assert.ok(inst, 'installHooks should return result');
-  assert.strictEqual(inst.added, 0, 'installHooks.added should be 0 (stub)');
-  assert.strictEqual(inst.skipped, true, 'installHooks.skipped should be true (stub)');
-  assert.ok(typeof inst.reason === 'string' && inst.reason.length > 0,
-    'installHooks.reason should be non-empty string');
+  assert.ok(inst.added >= 7, `installHooks.added should be >=7 (P11), got ${inst.added}`);
+  assert.ok(inst.hooksJsonPath, 'installHooks.hooksJsonPath should be set');
 
-  // uninstallHooks — returns no-op result
+  // markerPresent — should be true after install
+  assert.strictEqual(provider.markerPresent(), true, 'markerPresent should be true after install');
+
+  // uninstallHooks — removes our entries
   const uninst = provider.uninstallHooks();
   assert.ok(uninst, 'uninstallHooks should return result');
-  assert.ok(typeof uninst.reason === 'string' && uninst.reason.length > 0,
-    'uninstallHooks.reason should be non-empty string');
+  assert.ok(uninst.removed >= 7, `uninstallHooks.removed should be >=7, got ${uninst.removed}`);
 
-  // markerPresent — always false (no hooks installed)
-  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false (stub)');
+  // markerPresent — false after uninstall
+  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false after uninstall');
 
-  console.log('codex hook stubs (install/uninstall/marker): PASS');
+  // Cleanup
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  if (origCodexHome) process.env.CODEX_HOME = origCodexHome; else delete process.env.CODEX_HOME;
+
+  console.log('codex hook installer (install/uninstall/marker, #p11): PASS');
 }
 
 // ─── 6. makeNotImplemented stub 抛 ENOTIMPL ───────────────────────────────
