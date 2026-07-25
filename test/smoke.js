@@ -311,10 +311,8 @@ async function main() {
     assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-brand-new')));
 
   console.log('\n[19] 工具拉起的一次性目录会话 + 同项目欢迎频控');
-  // #greet-fix: 正则收紧到 /\/\.(claude|codex)\/sessions\//，原 .someapp/sessions
-  // 不再被识别为工具拉起（会触发 greet）。改用真实 Claude Code sessions 路径。
-  await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'toolspawn-ssss', cwd: '/Users/me/.claude/sessions/ab12cd34', session_source: 'startup' });
-  await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'toolspawn-ssss', cwd: '/Users/me/.claude/sessions/ab12cd34' });
+  await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'toolspawn-ssss', cwd: '/Users/me/.someapp/sessions/ab12cd34', session_source: 'startup' });
+  await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'toolspawn-ssss', cwd: '/Users/me/.someapp/sessions/ab12cd34' });
   check('隐藏目录 cwd（工具拉起）说话也不欢迎', () =>
     assert(!events.some((e) => e.kind === 'greet' && e.project === 'ab12cd34')));
   // 同项目名 30 分钟频控：第一次欢迎后，另一个同名项目的新对话不再欢迎

@@ -248,19 +248,13 @@ function buildPetStats(snapshot, pendingPermissions, metering, opts) {
     let reason = null;
     let choice = null;
 
-    // Claude hook 的「上一步干完了、下一步还没来」间隙：
+    // 「上一步干完了、下一步还没来」的间隙：
     //   - transcript 还在长（mtime 新鲜）= 模型在产出（重连后继续跑/流式输出）
     //     → 仍是干活，别误判摸鱼；
     //   - 文件不动才是真没动静 → 摸鱼（loafing），不硬说「思考中」。
     // 只认 PostToolUse/SubagentStop 间隙——PreToolUse 间隙是工具还在跑，仍算干活。
     // 真思考仍有渠道：UserPromptSubmit → thinking 是事件驱动的。
-    // #codewhale-loaf-fix: CodeWhale agent 不走这条启发式——它的 transcript
-    // 落盘机制与 Claude Code 不同（独立 rollout 文件，不写 ~/.claude/projects），
-    // transcriptActiveAt 经常不被设置或更新滞后，会误判"摸鱼"。CodeWhale 的
-    // working/thinking 状态完全由 hook 事件驱动（tool_call_before/after），
-    // 间隙期间应保持 working 而非 loafing。同步上游 c2669ba 对 codex 的修复。
-    if (e.agentId !== 'codewhale'
-      && state === 'working'
+    if (state === 'working'
       && e.lastEvent && (e.lastEvent.rawEvent === 'PostToolUse' || e.lastEvent.rawEvent === 'SubagentStop')
       && e.idleMs > LOAF_GAP_MS) {
       const producing = e.transcriptActiveAt && (Date.now() - e.transcriptActiveAt) < TRANSCRIPT_ACTIVE_MS;
@@ -399,14 +393,6 @@ function buildPetStats(snapshot, pendingPermissions, metering, opts) {
 // 可能用一次性目录拉起全新 claude（新 id/新 cwd/无历史/source=startup），
 // 与真·新对话在 hook 层面无法区分——频控是最后一道保险。
 const GREET_DEBOUNCE_MS = 30 * 60 * 1000;
-// SessionStart → UserPromptSubmit 首条 prompt 的资格窗口。原 5min 太短：
-// 用户启动 claude 后常超过 5min 才发首条 prompt（看 README、改配置、聊天窗口切走），
-// 导致 greetPending 失效、greet 永远不触发。放宽到 15min 匹配真实使用节奏。
-const GREET_PENDING_WINDOW_MS = 15 * 60 * 1000;
-// 真正的「宿主 app 拉起入口进程」一次性目录：~/.claude/sessions/<uuid>/ 这种
-// 是 Claude Code 自身会话存储路径。原正则 /\/\./ 误判 /home/z/.local/... 等合法路径。
-// 收紧到只匹配已知的 sessions/ 一次性目录前缀。
-const TOOL_SPAWNED_RE = /\/\.(claude|codex)\/sessions\//;
 const lastGreetAt = new Map(); // project -> ts
 
 function activityToEvents(act) {
@@ -423,19 +409,19 @@ function activityToEvents(act) {
       //     同样欢迎。所以 source 不参与资格判定，只看 isNew。
       // 排除项：
       //  - cwdActive：该项目已有忙碌/近期会话 → 是进入执行中的任务，不是新对话
-      //  - toolSpawned：~/.claude/sessions/<uuid> 一次性目录 → 宿主 app 拉起的入口进程
+      //  - toolSpawned：~/.xxx/sessions/<uuid> 一次性目录 → 宿主 app 拉起的入口进程
       // 入口/巡检类会话永远等不到 prompt，自然静默。
-      const toolSpawned = TOOL_SPAWNED_RE.test(session.cwd || '');
+      const toolSpawned = /\/\./.test(session.cwd || '');
       session.greetPending = (isNew && !cwdActive && !toolSpawned) ? Date.now() : null;
       break;
     }
     case 'UserPromptSubmit': {
-      // 新会话资格预审通过 + 第一条 prompt 在 GREET_PENDING_WINDOW_MS 内 + 同项目 30 分钟频控
+      // 新会话资格预审通过 + 第一条 prompt 在 5 分钟内 + 同项目 30 分钟频控
       // → 此刻才欢迎（弹射上线 2s，随后聚合态自然接管为 thinking）。
       const pendingAt = session.greetPending || 0;
       const recentlyGreeted = (Date.now() - (lastGreetAt.get(project) || 0)) < GREET_DEBOUNCE_MS;
       session.greetPending = null;
-      if (pendingAt && Date.now() - pendingAt < GREET_PENDING_WINDOW_MS && !recentlyGreeted) {
+      if (pendingAt && Date.now() - pendingAt < 5 * 60 * 1000 && !recentlyGreeted) {
         lastGreetAt.set(project, Date.now());
         out.push({ kind: 'greet', project, ts: Date.now() });
         break; // 欢迎已含「收到任务」之意，不再叠 user-turn（避免短暂态互抢）
@@ -464,11 +450,6 @@ function activityToEvents(act) {
         const ops = countRecentOps(session);
         if (ops >= 5) out.push({ kind: 'big-done', project, ops, ts: Date.now() });
         else out.push({ kind: 'turn-done', project, ops, ts: Date.now() });
-        // #attention-event: 在 turn-done/big-done 之外补一个 1.6s 的 attention 短暂态，
-        // 让 cat-attention.gif（"从工位起身够手机看消息"）有 1.6s 显示窗口。
-        // 不改 core.js 的 Stop=idle（保持与上游一致），不动 mapState 的归并逻辑
-        // （聚合态仍走 turn-done → idle），只在事件流里加一个 transient。
-        out.push({ kind: 'attention', project, ts: Date.now() + 1 });
       }
       if (assistantChanged && session.assistantLastOutput) {
         const emo = session.pendingAssistantEmotion || null;
