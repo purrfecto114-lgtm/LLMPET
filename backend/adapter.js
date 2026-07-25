@@ -248,13 +248,19 @@ function buildPetStats(snapshot, pendingPermissions, metering, opts) {
     let reason = null;
     let choice = null;
 
-    // 「上一步干完了、下一步还没来」的间隙：
+    // Claude hook 的「上一步干完了、下一步还没来」间隙：
     //   - transcript 还在长（mtime 新鲜）= 模型在产出（重连后继续跑/流式输出）
     //     → 仍是干活，别误判摸鱼；
     //   - 文件不动才是真没动静 → 摸鱼（loafing），不硬说「思考中」。
     // 只认 PostToolUse/SubagentStop 间隙——PreToolUse 间隙是工具还在跑，仍算干活。
     // 真思考仍有渠道：UserPromptSubmit → thinking 是事件驱动的。
-    if (state === 'working'
+    // #codewhale-loaf-fix: CodeWhale agent 不走这条启发式——它的 transcript
+    // 落盘机制与 Claude Code 不同（独立 rollout 文件，不写 ~/.claude/projects），
+    // transcriptActiveAt 经常不被设置或更新滞后，会误判"摸鱼"。CodeWhale 的
+    // working/thinking 状态完全由 hook 事件驱动（tool_call_before/after），
+    // 间隙期间应保持 working 而非 loafing。同步上游 c2669ba 对 codex 的修复。
+    if (e.agentId !== 'codewhale'
+      && state === 'working'
       && e.lastEvent && (e.lastEvent.rawEvent === 'PostToolUse' || e.lastEvent.rawEvent === 'SubagentStop')
       && e.idleMs > LOAF_GAP_MS) {
       const producing = e.transcriptActiveAt && (Date.now() - e.transcriptActiveAt) < TRANSCRIPT_ACTIVE_MS;

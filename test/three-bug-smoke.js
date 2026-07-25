@@ -199,15 +199,55 @@ function test_no_regression_on_basic_states() {
   console.log('Regression basic states: PASS');
 }
 
+// ─── Round 2: CodeWhale loafing fix (sync upstream c2669ba) ────────────────
+function test_codewhale_no_loafing() {
+  // CodeWhale agent 不应走 loafing 启发式（transcript 落盘机制不同）。
+  // 模拟 CodeWhale 会话: agentId='codewhale' + state='working' + PostToolUse 间隙
+  // > LOAF_GAP_MS(5s) → 不应被改为 'loafing'，仍保持 'working'。
+  const e = mkSession({
+    id: 'cw-1',
+    agentId: 'codewhale',
+    state: 'working',
+    cwd: '/home/user/myproject-cw',
+    idleMs: 30000, // > LOAF_GAP_MS
+    lastEvent: { rawEvent: 'PostToolUse', at: Date.now() - 30000 },
+    transcriptActiveAt: 0, // 不新鲜 → 普通 Claude 会话会判 loafing
+  });
+  const snap = { sessions: [e], active: null, idleMs: 30000, lastActivityTs: Date.now(), ts: Date.now() };
+  const stats = buildPetStats(snap, [], null, {});
+  const sess = stats.sessions[0];
+  assert.strictEqual(sess.state, 'working',
+    `Bug#codewhale-loaf: CodeWhale session should stay working, not loafing, got ${sess.state}`);
+
+  // 反例: Claude 会话(agentId='claude-code')同条件应判 loafing
+  const e2 = mkSession({
+    id: 'cc-1',
+    agentId: 'claude-code',
+    state: 'working',
+    cwd: '/home/user/myproject-cc',
+    idleMs: 30000,
+    lastEvent: { rawEvent: 'PostToolUse', at: Date.now() - 30000 },
+    transcriptActiveAt: 0,
+  });
+  const snap2 = { sessions: [e2], active: null, idleMs: 30000, lastActivityTs: Date.now(), ts: Date.now() };
+  const stats2 = buildPetStats(snap2, [], null, {});
+  const sess2 = stats2.sessions[0];
+  assert.strictEqual(sess2.state, 'loafing',
+    `Claude session with stale transcript should loafing, got ${sess2.state}`);
+
+  console.log('Round2 CodeWhale no-loafing: PASS');
+}
+
 // ─── Run ──────────────────────────────────────────────────────────────────
 function main() {
-  console.log('=== Three-bug fix smoke (Round 1) ===\n');
+  console.log('=== Three-bug fix smoke (Round 1+2) ===\n');
   test_attention_event();
   test_needsinput_via_notification();
   test_needsinput_via_elicitation();
   test_greet_window_widened();
   test_toolspawned_regex_tightened();
   test_no_regression_on_basic_states();
+  test_codewhale_no_loafing();
   console.log('\n=== ALL PASS ===');
 }
 

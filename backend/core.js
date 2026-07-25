@@ -414,7 +414,14 @@ function createCore(options = {}) {
             changed = true;
           }
         }
-      } catch {}
+      } catch (err) {
+        // #error-log-fix: 之前空 catch 会吞所有 refresh 错误（ENOENT 权限/JSON 解析
+        // 失败/transcript 损坏）。加 log 让 OCTOPUS_DEBUG=1 时能定位。不破坏原行为：
+        // 错误仍被忽略，只是日志可见。
+        if (process.env.OCTOPUS_DEBUG === '1') {
+          log('core', `refreshContextUsage failed for ${s.id.slice(0, 8)}: ${err.message}`);
+        }
+      }
     }
     return changed;
   }
