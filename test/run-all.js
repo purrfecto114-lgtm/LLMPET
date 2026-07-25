@@ -35,6 +35,7 @@ const tests = [
   'test/process-guards-smoke.js',      // #r10: Round 10 — process-level error guards
   'test/global-security-audit.js',     // #r10-security: Round 10 — global security audit
   'test/codex-installhooks-test.js',   // #p11: Round 11 — Codex provider installHooks
+  'test/opencode-installhooks-test.js', // #p12: Round 12 — Opencode provider installHooks
 ];
 
 for (const file of tests) {

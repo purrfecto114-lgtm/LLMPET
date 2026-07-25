@@ -169,23 +169,39 @@ function test_parseHookStdin_special_fields() {
   console.log('opencode parseHookStdin special fields: PASS');
 }
 
-// ─── 6. installHooks / uninstallHooks / markerPresent stub 行为 ──────────
+// ─── 6. installHooks / uninstallHooks / markerPresent (#p12 实现) ─────────
 function test_hook_stubs() {
+  // #p12: installHooks now writes ~/.config/opencode/plugins/octopus.js.
+  // Isolate HOME so we don't touch the real ~/.config/opencode.
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-smoke-'));
+  const origConfigDir = process.env.OPENCODE_CONFIG_DIR;
+  process.env.OPENCODE_CONFIG_DIR = path.join(tmpHome, '.config', 'opencode');
+
+  // installHooks — returns result with added=1
   const inst = provider.installHooks();
   assert.ok(inst, 'installHooks should return result');
-  assert.strictEqual(inst.added, 0, 'installHooks.added should be 0 (stub)');
-  assert.strictEqual(inst.skipped, true, 'installHooks.skipped should be true (stub)');
-  assert.ok(typeof inst.reason === 'string' && inst.reason.length > 0,
-    'installHooks.reason should be non-empty string');
+  assert.ok(inst.added >= 1, `installHooks.added should be >=1 (P12), got ${inst.added}`);
+  assert.ok(inst.pluginPath, 'installHooks.pluginPath should be set');
 
+  // markerPresent — true after install
+  assert.strictEqual(provider.markerPresent(), true, 'markerPresent should be true after install');
+
+  // uninstallHooks — removes our plugin
   const uninst = provider.uninstallHooks();
   assert.ok(uninst, 'uninstallHooks should return result');
-  assert.ok(typeof uninst.reason === 'string' && uninst.reason.length > 0,
-    'uninstallHooks.reason should be non-empty string');
+  assert.ok(uninst.removed >= 1, `uninstallHooks.removed should be >=1, got ${uninst.removed}`);
 
-  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false (stub)');
+  // markerPresent — false after uninstall
+  assert.strictEqual(provider.markerPresent(), false, 'markerPresent should be false after uninstall');
 
-  console.log('opencode hook stubs (install/uninstall/marker): PASS');
+  // Cleanup
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  if (origConfigDir) process.env.OPENCODE_CONFIG_DIR = origConfigDir; else delete process.env.OPENCODE_CONFIG_DIR;
+
+  console.log('opencode hook installer (install/uninstall/marker, #p12): PASS');
 }
 
 // ─── 7. makeNotImplemented stub 抛 ENOTIMPL ───────────────────────────────

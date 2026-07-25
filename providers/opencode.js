@@ -196,21 +196,23 @@ function parseHookStdin(event, payload) {
   return body;
 }
 
-// ── Hook installer (stub — does not write opencode plugin yet) ──────────────
-// A future implementation (P12) would write an opencode plugin JS module
-// to ~/.config/opencode/plugins/octopus.js that POSTs lifecycle events to
-// Octopus's /state endpoint. For now it returns a no-op result.
+// ── Hook installer (Round 12, #p12) ─────────────────────────────────────────
+// Writes ~/.config/opencode/plugins/octopus.js (auto-loaded by opencode at startup).
+// Delegates to backend/opencode-hooks.js (atomic file copy with content hash check).
+// Idempotent: re-running installHooks() overwrites only if content changed.
 function installHooks() {
-  // TODO (P12): write opencode plugin JS module to ~/.config/opencode/plugins/
-  return { added: 0, skipped: true, reason: 'opencode plugin not yet implemented (stub provider, Round 5)' };
+  const opencodeHooks = require('../backend/opencode-hooks');
+  return opencodeHooks.registerHooks();
 }
 
-function uninstallHooks() {
-  return { removed: 0, reason: 'opencode plugin not yet implemented (stub provider, Round 5)' };
+function uninstallHooks(opts) {
+  const opencodeHooks = require('../backend/opencode-hooks');
+  return opencodeHooks.unregisterHooks(opts || {});
 }
 
 function markerPresent() {
-  return false; // No plugin installed yet
+  const opencodeHooks = require('../backend/opencode-hooks');
+  return opencodeHooks.markerPresent();
 }
 
 // ── Provider descriptor ─────────────────────────────────────────────────────
@@ -280,13 +282,13 @@ const provider = {
   },
 
   capabilities: {
-    permissionBubble: false,  // TBI in P12+
+    permissionBubble: false,  // #p12: plugin installed but permission bridge TBI
     metering: false,          // TBI in P12+
     sessionList: false,       // TBI in P12+
     transcriptBubble: false,  // TBI in P12+
     focus: false,             // TBI
     launch: false,            // TBI: find opencode binary and open terminal
-    greetSleep: true,         // session_start/session_end events exist
+    greetSleep: true,         // #p12: plugin installed (session.idle + chat.prompt)
   },
 
   installHooks,
