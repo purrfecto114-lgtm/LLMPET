@@ -1,7 +1,9 @@
 'use strict';
 // R20-拓展: Provider lazy loading verification
-// Ensures codewhale and aider are NOT loaded at module require time,
+// Ensures codewhale/codex/opencode/aider are NOT loaded at module require time,
 // and are only loaded on first getProvider() / getActiveProviders() call.
+//
+// #r5: Updated from 3 providers to 5 (added codex + opencode in Round 5).
 
 const path = require('path');
 const fs = require('fs');
@@ -22,9 +24,11 @@ console.log('[L1] ALL_IDS is static (no module loading)');
 
   const idx = require('../providers/index');
   assert(Array.isArray(idx.ALL_IDS), 'ALL_IDS is array');
-  assert(idx.ALL_IDS.length === 3, 'ALL_IDS has 3 entries');
+  assert(idx.ALL_IDS.length === 5, 'ALL_IDS has 5 entries (#r5: +codex +opencode)');
   assert(idx.ALL_IDS.includes('claude'), 'includes claude');
   assert(idx.ALL_IDS.includes('codewhale'), 'includes codewhale');
+  assert(idx.ALL_IDS.includes('codex'), 'includes codex (#r5)');
+  assert(idx.ALL_IDS.includes('opencode'), 'includes opencode (#r5)');
   assert(idx.ALL_IDS.includes('aider'), 'includes aider');
   assert(Object.isFrozen(idx.ALL_IDS), 'ALL_IDS is frozen');
 }
@@ -63,6 +67,28 @@ console.log('[L4] aider loads on demand via getProvider');
   assert(aider !== null, 'aider loaded on demand');
   assert(aider.id === 'aider', 'aider.id correct');
   assert(typeof aider.parseHookStdin === 'function', 'aider has parseHookStdin');
+}
+
+console.log('[L4b] codex loads on demand via getProvider (#r5)');
+{
+  delete require.cache[require.resolve('../providers/index')];
+  delete require.cache[require.resolve('../providers/codex')];
+  const idx = require('../providers/index');
+  const codex = idx.getProvider('codex');
+  assert(codex !== null, 'codex loaded on demand');
+  assert(codex.id === 'codex', 'codex.id correct');
+  assert(typeof codex.parseHookStdin === 'function', 'codex has parseHookStdin');
+}
+
+console.log('[L4c] opencode loads on demand via getProvider (#r5)');
+{
+  delete require.cache[require.resolve('../providers/index')];
+  delete require.cache[require.resolve('../providers/opencode')];
+  const idx = require('../providers/index');
+  const oc = idx.getProvider('opencode');
+  assert(oc !== null, 'opencode loaded on demand');
+  assert(oc.id === 'opencode', 'opencode.id correct');
+  assert(typeof oc.parseHookStdin === 'function', 'opencode has parseHookStdin');
 }
 
 console.log('[L5] unknown provider returns null without crash');
@@ -104,19 +130,23 @@ console.log('[L7] getActiveProviders with OCTOPUS_PROVIDER=codewhale');
   delete process.env.OCTOPUS_PROVIDER;
 }
 
-console.log('[L8] getActiveProviders with OCTOPUS_PROVIDER=all loads all 3');
+console.log('[L8] getActiveProviders with OCTOPUS_PROVIDER=all loads all 5 (#r5)');
 {
   process.env.OCTOPUS_PROVIDER = 'all';
   delete require.cache[require.resolve('../providers/index')];
   delete require.cache[require.resolve('../providers/codewhale')];
+  delete require.cache[require.resolve('../providers/codex')];
+  delete require.cache[require.resolve('../providers/opencode')];
   delete require.cache[require.resolve('../providers/aider')];
 
   const idx = require('../providers/index');
   const active = idx.getActiveProviders();
-  assert(active.length === 3, '3 active providers with "all"');
+  assert(active.length === 5, '5 active providers with "all" (#r5)');
   const ids = active.map(p => p.id);
   assert(ids.includes('claude'), 'claude in active');
   assert(ids.includes('codewhale'), 'codewhale in active');
+  assert(ids.includes('codex'), 'codex in active (#r5)');
+  assert(ids.includes('opencode'), 'opencode in active (#r5)');
   assert(ids.includes('aider'), 'aider in active');
   delete process.env.OCTOPUS_PROVIDER;
 }
@@ -133,23 +163,27 @@ console.log('[L9] invalidate resets cache but keeps loaded providers');
   // Switch to all
   process.env.OCTOPUS_PROVIDER = 'all';
   delete require.cache[require.resolve('../providers/codewhale')];
+  delete require.cache[require.resolve('../providers/codex')];
+  delete require.cache[require.resolve('../providers/opencode')];
   delete require.cache[require.resolve('../providers/aider')];
   const after = idx.invalidate();
-  assert(after.activeIds.length === 3, 'after invalidate: 3 providers');
+  assert(after.activeIds.length === 5, 'after invalidate: 5 providers (#r5)');
   delete process.env.OCTOPUS_PROVIDER;
 }
 
-console.log('[L10] lazy load does not break provider-validate test expectations');
+console.log('[L10] lazy load does not break provider-validate test expectations (#r5)');
 {
   delete require.cache[require.resolve('../providers/index')];
   delete require.cache[require.resolve('../providers/codewhale')];
+  delete require.cache[require.resolve('../providers/codex')];
+  delete require.cache[require.resolve('../providers/opencode')];
   delete require.cache[require.resolve('../providers/aider')];
   delete require.cache[require.resolve('../providers/claude')];
 
   const { getProvider, ALL_IDS, is_active, getActiveIds } = require('../providers/index');
 
-  // All IDs still accessible
-  assert(ALL_IDS.length === 3, 'ALL_IDS still 3 after fresh load');
+  // All IDs still accessible (#r5: 5 providers now)
+  assert(ALL_IDS.length === 5, 'ALL_IDS still 5 after fresh load (#r5)');
 
   // getProvider works for all
   for (const id of ALL_IDS) {
@@ -161,6 +195,8 @@ console.log('[L10] lazy load does not break provider-validate test expectations'
   // is_active works
   assert(is_active('claude') === true, 'claude is active by default');
   assert(typeof is_active('codewhale') === 'boolean', 'is_active returns boolean for codewhale');
+  assert(typeof is_active('codex') === 'boolean', 'is_active returns boolean for codex (#r5)');
+  assert(typeof is_active('opencode') === 'boolean', 'is_active returns boolean for opencode (#r5)');
 
   // getActiveIds works
   const ids = getActiveIds();

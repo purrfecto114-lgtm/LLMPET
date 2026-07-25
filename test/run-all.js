@@ -27,6 +27,8 @@ const tests = [
   'test/codewhale-hook-security.js',
   'test/codewhale-provider-security.js',
   'test/aider-provider-smoke.js',
+  'test/codex-provider-smoke.js',       // #r5: Round 5 — Codex provider stub
+  'test/opencode-provider-smoke.js',    // #r5: Round 5 — OpenCode provider stub
 ];
 
 for (const file of tests) {

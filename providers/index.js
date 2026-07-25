@@ -8,15 +8,23 @@
 // behaves exactly as before until a user opts into codewhale.
 //
 // Selection rules (first match wins):
-//   1. env OCTOPUS_PROVIDER='claude' | 'codewhale' | 'claude,codewhale' | 'all'
+//   1. env OCTOPUS_PROVIDER='claude' | 'codewhale' | 'codex' | 'opencode' |
+//          'aider' | 'claude,codewhale' | 'all'
 //   2. ~/.octopus/config.json field `providers` (array of ids) — set by the
 //      detail panel in a later round.
 //   3. default: ['claude']
 //
 // Providers are loaded lazily: only the claude provider is required at module
-// load time. codewhale and aider are required on first access via getProvider()
-// or when they appear in the active selection. This saves ~50ms startup for
-// default claude-only users (avoids parsing codewhale.js + its dependencies).
+// load time. codewhale, codex, opencode, and aider are required on first
+// access via getProvider() or when they appear in the active selection. This
+// saves ~50ms startup for default claude-only users.
+//
+// Provider priority (per user 2026-07-25 update):
+//   1. codewhale  — fully implemented (hook + permission + metering + session)
+//   2. claude     — fully implemented (default)
+//   3. codex      — Round 5 stub (parseHookStdin works; installHooks TBI in P11)
+//   4. opencode   — Round 5 stub (parseHookStdin works; installHooks TBI in P12)
+//   5. aider      — Round 3 stub (no native hook system)
 
 const { validateProvider } = require('./base');
 const config = require('../backend/config');
@@ -25,6 +33,8 @@ const config = require('../backend/config');
 const PROVIDER_MODULES = {
   claude: './claude',
   codewhale: './codewhale',
+  codex: './codex',          // #r5: Round 5 — Codex (new ChatGPT CLI) stub
+  opencode: './opencode',    // #r5: Round 5 — OpenCode (SST) stub
   aider: './aider',
 };
 
