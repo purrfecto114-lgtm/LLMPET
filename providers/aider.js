@@ -71,6 +71,7 @@ function parseHookStdin(event, payload) {
 
   const body = {
     provider: ID,
+    agentId: ID,  // #r4-fix: set agentId so core.toEntry doesn't default to 'claude-code'
     event: mapping.internal,
     state: mapping.state,
     session_id: sid,

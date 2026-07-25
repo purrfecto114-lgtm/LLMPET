@@ -306,8 +306,8 @@ function createServer(deps) {
         tmuxSocket: normTmuxSocket(data.tmux_socket),
         tmuxClient: normTmuxClient(data.tmux_client),
         ghosttyTerminalId: normText(data.ghostty_terminal_id, 256),
-        agentId: data.provider === 'codewhale' ? 'codewhale' : 'claude-code',
-        provider: data.provider === 'codewhale' ? 'codewhale' : null,
+        agentId: data.provider || 'claude-code',  // #r4-fix: respect provider identity (aider/codewhale) instead of hardcoding
+        provider: data.provider || null,  // #r4-fix: preserve provider identity for aider/codewhale instead of nullifying
         headless: data.headless === true,
         transcriptPath: normTranscriptPath(data.transcript_path, transcriptRoots),
         model: normText(data.model, 128),

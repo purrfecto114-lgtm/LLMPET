@@ -70,6 +70,8 @@ function test_parseHookStdin_event_mapping() {
     assert.strictEqual(body.model, model, `${c.event}: model preserved`);
     assert.strictEqual(body.background_tasks_count, 0, `${c.event}: background_tasks_count default 0`);
     assert.strictEqual(body.session_crons_count, 0, `${c.event}: session_crons_count default 0`);
+    // #r4-fix: verify agentId is set to 'aider' (not defaulted to 'claude-code')
+    assert.strictEqual(body.agentId, 'aider', `${c.event}: agentId should be 'aider'`);
   }
 
   console.log('aider parseHookStdin event mapping (5 events): PASS');
