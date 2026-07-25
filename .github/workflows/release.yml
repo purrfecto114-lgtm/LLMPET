@@ -134,11 +134,20 @@ jobs:
           node-version: '22'
 
       - name: Install build deps (npm ci)
-        # electron's postinstall downloads a ~100MB binary per OS. We let it
-        # run here because the packaging scripts copy from
-        # node_modules/electron/dist on Linux/macOS. The Windows build script
-        # downloads its own win32 Electron zip regardless.
         run: npm ci
+
+      - name: Download Electron platform binary (#r10-release-fix)
+        # Electron 43.x no longer runs install.js as a postinstall script.
+        # The packaging scripts (package-linux.sh / package-mac.sh) copy from
+        # node_modules/electron/dist, so we must run install.js manually to
+        # download the platform-matched Electron binary (~100-150MB).
+        # The Windows build script downloads its own win32 Electron zip, so
+        # we skip this step for the windows matrix entry.
+        if: matrix.script != 'package:win'
+        run: node node_modules/electron/install.js
+        env:
+          # Speed up: don't force cache
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '0'
 
       - name: Build package (${{ matrix.script }})
         run: npm run ${{ matrix.script }}
