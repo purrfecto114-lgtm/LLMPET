@@ -618,6 +618,119 @@ check('shouldAbort(弹层打开)→ 广播 abort 复位表情并回家', async (
   assert.deepStrictEqual(lastTween, [0, 0], '撤退后应回到出发位');
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// [T7] Codex/ChatGPT 桌宠识别分支覆盖 (Round 6, #r6)
+// ─────────────────────────────────────────────────────────────────────────────
+// 覆盖 parseScan + scanCandidateScore 中 7 处 Codex/ChatGPT 引用中
+// 尚未测试的分支：
+//   - /chatgpt/i 大小写不敏感匹配
+//   - 24px 轮廓容差边界 (|Δw| + |Δh| > 24 → 排除)
+//   - 同 PID 多窗口去重（ChatGPT 寄生型：主窗+宠物窗同进程）
+//   - 非 ChatGPT 桌宠的面积评分路径
+//   - excludePids 排除自身进程
+//   - 含 "ChatGPT" 子串的变体名
+//   - scanCandidateScore 精确轮廓分数
+// Web 验证: 356×320 尺寸来源 https://github.com/openai/codex/issues/20706
+
+console.log('[T7] Codex/ChatGPT 桌宠识别: parseScan 分支覆盖');
+check('大小写不敏感: "chatgpt" (全小写) 仍走轮廓过滤', () => {
+  const r = parseScan('chatgpt|42|100|200|356|320\n', []);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].w, 356);
+});
+check('大小写不敏感: "CHATGPT" (全大写) 仍走轮廓过滤', () => {
+  const r = parseScan('CHATGPT|42|100|200|356|320\n', []);
+  assert.strictEqual(r.length, 1);
+});
+check('含 ChatGPT 子串的变体名也匹配: "ChatGPT Desktop"', () => {
+  const r = parseScan('ChatGPT Desktop|42|100|200|356|320\n', []);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].name, 'ChatGPT Desktop');
+});
+check('24px 轮廓容差: 恰好在边界内 (|Δw|+|Δh| = 24) → 保留', () => {
+  // 356+12=368, 320+12=332 → |368-356|+|332-320| = 12+12 = 24，NOT > 24 → 保留
+  const r = parseScan('ChatGPT|42|100|200|368|332\n', []);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].w, 368);
+});
+check('24px 轮廓容差: 超出边界 (|Δw|+|Δh| = 26) → 硬过滤排除', () => {
+  // 356+13=369, 320+13=333 → |369-356|+|333-320| = 13+13 = 26 > 24 → 排除
+  const r = parseScan('ChatGPT|42|100|200|369|333\n', []);
+  assert.strictEqual(r.length, 0);
+});
+check('24px 轮廓容差: 宽度超出但高度完美 → 仍被排除', () => {
+  // |380-356|+|320-320| = 24, NOT > 24 → 保留（边界 case）
+  const r = parseScan('ChatGPT|42|100|200|380|320\n', []);
+  assert.strictEqual(r.length, 1);
+  // |381-356|+|320-320| = 25 > 24 → 排除
+  const r2 = parseScan('ChatGPT|42|100|200|381|320\n', []);
+  assert.strictEqual(r2.length, 0);
+});
+check('同 PID 多窗口: 主窗(大) + 宠物窗(356×320) → 选宠物窗', () => {
+  const out = 'ChatGPT|42|100|100|1512|865\nChatGPT|42|500|300|356|320\n';
+  const r = parseScan(out, []);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].x, 500);
+  assert.strictEqual(r[0].w, 356);
+  assert.strictEqual(r[0].h, 320);
+});
+check('同 PID 多窗口: 两扇都超轮廓容差 → 都排除', () => {
+  const out = 'ChatGPT|42|100|100|400|380\nChatGPT|42|500|300|450|400\n';
+  const r = parseScan(out, []);
+  assert.strictEqual(r.length, 0);
+});
+check('excludePids: 排除自身 PID 的 ChatGPT 宠物窗', () => {
+  const r = parseScan('ChatGPT|42|100|200|356|320\n', [42]);
+  assert.strictEqual(r.length, 0);
+});
+check('excludePids: 不排除其他 PID 的 ChatGPT 宠物窗', () => {
+  const r = parseScan('ChatGPT|42|100|200|356|320\n', [99]);
+  assert.strictEqual(r.length, 1);
+});
+
+console.log('[T7b] scanCandidateScore: Codex/ChatGPT 轮廓评分 vs 面积评分');
+check('ChatGPT 精确 356×320 → shape=0 (最优)', () => {
+  assert.strictEqual(scanCandidateScore({ name: 'ChatGPT', w: 356, h: 320 }), 0);
+});
+check('ChatGPT 354×318 → shape=4 (微小偏差)', () => {
+  assert.strictEqual(scanCandidateScore({ name: 'ChatGPT', w: 354, h: 318 }), 4);
+});
+check('ChatGPT 350×310 → shape=16 (较大偏差, 但仍在容差内)', () => {
+  assert.strictEqual(scanCandidateScore({ name: 'ChatGPT', w: 350, h: 310 }), 16);
+});
+check('非 ChatGPT 桌宠: 面积评分 (w×h)', () => {
+  assert.strictEqual(scanCandidateScore({ name: 'Desktop Goose', w: 180, h: 160 }), 28800);
+  assert.strictEqual(scanCandidateScore({ name: 'BongoCat', w: 120, h: 120 }), 14400);
+});
+check('ChatGPT 轮廓评分永远低于同面积非 ChatGPT 评分', () => {
+  // 356×320 = 113920 面积. 同面积的非 ChatGPT 评分 = 113920.
+  // ChatGPT 精确匹配 = 0. 0 < 113920.
+  const cwScore = scanCandidateScore({ name: 'ChatGPT', w: 356, h: 320 });
+  const otherScore = scanCandidateScore({ name: 'Desktop Goose', w: 356, h: 320 });
+  assert(cwScore < otherScore, 'ChatGPT 精确匹配应比同面积非 ChatGPT 评分低');
+});
+
+console.log('[T7c] 混合场景: ChatGPT + 独立型桌宠共存');
+check('ChatGPT 宠物窗 + Desktop Goose → 两个对手', () => {
+  const out = 'ChatGPT|42|100|200|356|320\nDesktop Goose|99|400|100|180|160\n';
+  const r = parseScan(out, []);
+  assert.strictEqual(r.length, 2);
+  const names = r.map(ri => ri.name).sort();
+  assert.deepStrictEqual(names, ['ChatGPT', 'Desktop Goose']);
+});
+check('ChatGPT 宠物窗 + 非 356×320 popup → 只认宠物窗', () => {
+  const out = 'ChatGPT|42|100|100|356|320\nChatGPT|42|200|200|300|250\n';
+  const r = parseScan(out, []);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].x, 100);
+  assert.strictEqual(r[0].w, 356);
+});
+check('ChatGPT 大主窗 + 非 356×320 popup → 都排除, 不误认', () => {
+  const out = 'ChatGPT|42|100|100|1512|865\nChatGPT|42|200|200|300|250\n';
+  const r = parseScan(out, []);
+  assert.strictEqual(r.length, 0);
+});
+
 Promise.all(pending).then(() => {
   if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
   console.log('\nterritory: all passed');
