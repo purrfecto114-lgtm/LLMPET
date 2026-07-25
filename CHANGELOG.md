@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.2-pre Round 2 — CodeWhale loafing fix + 错误日志强化 (2026-07-25)
+
+### 修复
+
+#### CodeWhale loafing 误判（同步上游 c2669ba）
+
+`adapter.js` buildPetStats 的 loafing 启发式加 `e.agentId !== 'codewhale'` 排除。CodeWhale 不走 `~/.claude/projects` transcript 落盘机制，`transcriptActiveAt` 经常不被设置或更新滞后，会误判"摸鱼"。CodeWhale 的 working/thinking 状态完全由 hook 事件驱动（`tool_call_before`/`tool_call_after`），间隙期间应保持 working 而非 loafing。
+
+这与上游 c2669ba 对 codex 的修复同等机制、同等修复，适用 fork 的 CodeWhale 路径。
+
+#### core.js refreshContextUsage 错误日志
+
+`core.js` 第 417 行的空 catch 加 `OCTOPUS_DEBUG=1` 时的 log，不再静默吞 ENOENT/JSON 解析失败/transcript 损坏错误。零行为变化。
+
+### 测试
+
+- `test/three-bug-smoke.js` 加 `test_codewhale_no_loafing`（codewhale 保持 working，claude 同条件 loafing 反例验证）
+- 全量 `npm test` 21 个文件 PASS（~9s）
+- 新增 `scripts/round2-smoke.js` 端到端冒烟测试：起真实 HTTP server 模拟 codewhale-hook 5 事件流（SessionStart → UserPromptSubmit → PreToolUse → PostToolUse → 6s 等待 → Stop），验证 stats 路径 `state=working` + `Stop=idle+badge=done`
+
+### Web 调研
+
+- 上游 c2669ba patch 通过 GitHub API 获取，确认只改 `backend/adapter.js`(+5/-2) + `backend/codex-watch.js` + `renderer/pet.js` + tests
+- fork 没有 codex-watch.js，但 adapter.js 的 hunk 直接适用 CodeWhale 路径（agentId='codewhale' 见 server.js L309）
+
+### 自主推进
+
+本轮按用户指定流程：todolist → Web 调研 → 多角度方法讨论（3 方案对比表）→ 编写 → 验证（21 测试 PASS）→ 冒烟测试（端到端通过）。`scripts/autonomous-daemon.sh` 每 30min 自动跑测试 + 写检查报告到 `download/reports/`。
+
+---
+
 ## 0.1.2-pre — three-bug state machine fixes + autonomous Round 1 (2026-07-24)
 
 ### 修复的三个 bug
