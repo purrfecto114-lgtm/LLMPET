@@ -30,6 +30,9 @@ const { makeNotImplemented } = require('./base');
 const ID = 'aider';
 
 const DATA_HOME = path.join(os.homedir(), '.aider');
+// #p17: aider searches for .aider.conf.yml in git root, cwd, or HOME (not ~/.aider/).
+// The default HOME config is ~/.aider.conf.yml (a file, not a directory).
+const CONFIG_FILE = path.join(os.homedir(), '.aider.conf.yml');
 
 const HOOK_SCRIPT = path.join(__dirname, '..', 'hook', 'aider-hook.js');
 const HOOK_MARKER = 'aider-hook.js';
@@ -106,11 +109,15 @@ const provider = {
   displayName: 'Aider',
 
   dirs: {
-    settingsFile: path.join(DATA_HOME, '.aider.conf.yml'),
+    // #p17: aider config is ~/.aider.conf.yml (file in HOME, not ~/.aider/ dir).
+    // Verified via `aider --help`: searches git root, cwd, then HOME.
+    settingsFile: CONFIG_FILE,
     settingsFormat: 'yaml',
     dataHome: DATA_HOME,
-    configDir: DATA_HOME,
+    configDir: os.homedir(),  // #p17: config lives in HOME, not ~/.aider
     envOverride: null, // aider doesn't have a standard env override for home
+    // #p17: venv binary path (if installed via `python -m venv && pip install aider-chat`)
+    venvBin: path.join(os.homedir(), '.aider-venv', 'bin', 'aider'),
   },
 
   hookScript: HOOK_SCRIPT,

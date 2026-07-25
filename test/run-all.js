@@ -36,6 +36,7 @@ const tests = [
   'test/global-security-audit.js',     // #r10-security: Round 10 — global security audit
   'test/codex-installhooks-test.js',   // #p11: Round 11 — Codex provider installHooks
   'test/opencode-installhooks-test.js', // #p12: Round 12 — Opencode provider installHooks
+  'test/aider-binary-smoke.js',        // #p17: Round 17 — real Aider CLI binary
 ];
 
 for (const file of tests) {
