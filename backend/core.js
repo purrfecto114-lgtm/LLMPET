@@ -113,6 +113,10 @@ function createCore(options = {}) {
   /** @type {Map<string, object>} */
   const sessions = new Map();
   let cleanupTimer = null;
+  // #r7-fix: pendingBackfill gates the deferred initial backfill so a rapid
+  // stopStaleCleanup() (e.g. app quit during boot) cancels the pending
+  // setImmediate callback instead of running filesystem scans after shutdown.
+  let pendingBackfill = false;
 
   function ensureSessionCapacity(incomingId) {
     if (sessions.has(incomingId) || sessions.size < MAX_SESSIONS) return;
@@ -459,13 +463,41 @@ function createCore(options = {}) {
 
   function startStaleCleanup() {
     if (cleanupTimer) return;
-    try { backfillFromTranscripts(); } catch (e) { log('core', 'backfill failed:', e.message); }
+    // Start the periodic cleanup interval immediately so 10s sweeps begin
+    // right away — this is just a setInterval registration, no I/O.
     cleanupTimer = setInterval(cleanStaleSessions, 10000);
     if (cleanupTimer.unref) cleanupTimer.unref();
+    // #r7-fix: defer the initial backfill to the next event-loop tick so
+    // Electron boot (BrowserWindow creation, IPC handler registration,
+    // first paint) is not blocked by a synchronous filesystem scan of
+    // ~/.claude/projects (up to BACKFILL_SCAN_MAX=5000 files + reading
+    // tails of up to BACKFILL_MAX=15 transcripts). The periodic 10s
+    // sweep above already calls refreshContextUsage() which does the
+    // ongoing tail re-reads, so the only thing deferred is the one-shot
+    // boot seeding. References:
+    //   - https://electronjs.org/docs/latest/tutorial/performance
+    //     "If you have expensive setup operations, consider deferring those."
+    //   - https://nodejs.org/learn/asynchronous-work/event-loop-timers-and-nexttick
+    //     setImmediate schedules the callback after I/O events in the
+    //     current loop, so pending I/O (window load) runs first.
+    // If a /state request arrives before backfill completes, buildSnapshot()
+    // simply returns an empty (or partial) session list — same as on a
+    // fresh install with no transcripts. No data loss; hooks will still
+    // populate sessions as they fire.
+    pendingBackfill = true;
+    setImmediate(() => {
+      if (!pendingBackfill) return; // cancelled by stopStaleCleanup
+      pendingBackfill = false;
+      try { backfillFromTranscripts(); } catch (e) { log('core', 'backfill failed:', e.message); }
+    });
   }
 
   function stopStaleCleanup() {
     if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null; }
+    // #r7-fix: cancel any pending deferred backfill so a rapid
+    // start→stop cycle (e.g. test teardown, app quit during boot)
+    // doesn't leak a filesystem-scan callback running after shutdown.
+    pendingBackfill = false;
   }
 
   return {
