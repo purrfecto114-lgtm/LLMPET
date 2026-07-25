@@ -32,6 +32,7 @@ const tests = [
   'test/boot-defer-smoke.js',           // #r7: Round 7 — boot backfill defer
   'test/codewhale-binary-smoke.js',     // #r8: Round 8 — real Codewhale CLI binary
   'test/multi-provider-binary-smoke.js', // #r9: Round 9 — real codex/opencode/claude binary
+  'test/process-guards-smoke.js',      // #r10: Round 10 — process-level error guards
 ];
 
 for (const file of tests) {

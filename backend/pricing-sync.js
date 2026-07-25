@@ -158,7 +158,7 @@ function createPricingSync(options = {}) {
       }
       const fams = Object.keys(pricing).join('/');
       log('pricing', `synced from LiteLLM (${fams}; ${Object.keys(models).length} models)`);
-      try { onUpdate(); } catch {}
+      try { onUpdate(); } catch (e) { log('pricing', 'onUpdate callback failed:', e.message); } // #r10
     } catch (e) {
       log('pricing', 'sync skipped:', e.message);
     }

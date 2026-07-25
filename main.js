@@ -2,10 +2,15 @@
 
 // Octopus — Electron main process.
 //
-// Boot order: core (session state) → metering (cost) → permissions → HTTP
+// Boot order: process guards → core (session state) → metering (cost) → permissions → HTTP
 // server → install Claude Code hooks (using the bound port) → start watcher.
 // Wiring: core/permission activity → adapter → pet:event / pet:stats pushed to
 // the renderer over the preload IPC contract.
+
+// #r10: Install process-level error guards BEFORE any other module.
+// Catches unhandledRejection (log, don't crash) and uncaughtException (log, exit).
+const { installProcessGuards } = require('./backend/process-guards');
+installProcessGuards();
 
 const path = require('path');
 const fs = require('fs');

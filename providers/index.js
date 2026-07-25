@@ -83,7 +83,7 @@ function readConfigSelection() {
   try {
     const selected = config.get().providers;
     return Array.isArray(selected) && selected.length ? selected.slice() : null;
-  } catch {}
+  } catch (e) { console.warn(`[providers] readConfigSelection failed: ${e.message}`); } // #r10
   return null;
 }
 

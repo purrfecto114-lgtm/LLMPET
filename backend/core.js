@@ -418,7 +418,7 @@ function createCore(options = {}) {
             changed = true;
           }
         }
-      } catch {}
+      } catch (e) { log('core', 'refreshContextUsage error for session', s.id ? s.id.slice(0, 8) : '?', ':', e.message); } // #r10
     }
     return changed;
   }
