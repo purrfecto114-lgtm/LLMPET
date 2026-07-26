@@ -1,5 +1,7 @@
 # 🐙 Octopus — Claude Code / CodeWhale 桌面宠物
 
+[简体中文](README.md) | [English](README_EN.md) | [日本語](README_JA.md)
+
 一个实时盯着 **Claude Code** 及 **CodeWhale**（开源 Rust 终端 coding agent）等 coding agent 的桌面宠物：它会随 agent 的状态变表情（思考 / 干活 / 等你授权 / 完成庆祝 / 睡觉），把 agent 的回复弹成气泡，遇到需要授权时让你一键允许 / 拒绝，并在详情面板里给出 **token 计量与花费**、用量趋势、会话列表。
 
 共三款皮肤：章鱼 🐙、像素怪兽 👾、月薪喵 🐱（猫 meme 表情包，素材来自抖音 @月薪喵，见 `assets/cat/CREDITS.md`）。后端（状态机 / 计量 / 权限 / 进程对账）从零自有实现。整个项目以 **MIT** 开源，通过 Claude Code 与 CodeWhale 的公开 hook 接口接入；不注入 agent 进程。
