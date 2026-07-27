@@ -1,4 +1,4 @@
-# 🐙 Octopus — Claude Code / CodeWhale 桌面宠物
+# 🐙 Octopus — Claude Code / CodeWhale 桌面宠物(转移到：https://github.com/purrfecto114-lgtm/RE-LLMPET)
 
 [简体中文](README.md) | [English](README_EN.md) | [日本語](README_JA.md)
 
