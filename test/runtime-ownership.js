@@ -12,8 +12,12 @@ const path = require('path');
 
 // ⚠️ HOME 覆盖必须在 transport require 之前（transport 在模块加载时固化
 // RUNTIME_PATH —— e2e 测试开发时踩过的真实坑）
+// ⚠️ Windows 的 os.homedir() 读 USERPROFILE 而非 HOME —— 两个都覆盖，
+// 否则 windows-latest 上 runtime.json 会写进真实用户目录（e2e 套件曾
+// 因此确定性全红，见 e2e-codewhale.js 文件头注释）。
 const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-home-'));
 process.env.HOME = fakeHome;
+process.env.USERPROFILE = fakeHome;
 process.env.OCTOPUS_ALLOW_MULTI = '1';
 
 const { createServer } = require('../backend/server');
