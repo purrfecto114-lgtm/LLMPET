@@ -108,16 +108,22 @@ async function main() {
   } finally {
     clearInterval(keepAlive);
     for (const s of servers) { try { s.stop(); } catch {} }
-    try { fs.rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+    // 收尾卫生：本进程起的 server 在 fakeHome/.octopus/octopus.log 上持有
+    // 追加流句柄；Windows 上必须先关句柄再删沙箱（否则 rmdir ENOTEMPTY），
+    // maxRetries 兑付刚退出子进程的 delete-pending 短窗口。与
+    // e2e-codewhale.js 收尾同一套防护。
+    try { await require('../backend/log').shutdown(); } catch {}
+    try { fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch {}
     // 不用 process.exit()：管道 stdout 是异步的，立即退出会截断未刷盘的
     // 输出（开发本测试时真实踩到的坑）。exitCode + 自然退出让缓冲刷完。
     process.exitCode = 0;
   }
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error('runtime ownership FAILED:', e.message);
   for (const s of servers) { try { s.stop(); } catch {} }
-  try { fs.rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+  try { await require('../backend/log').shutdown(); } catch {}
+  try { fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch {}
   process.exitCode = 1;
 });

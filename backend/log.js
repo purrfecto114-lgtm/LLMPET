@@ -71,4 +71,23 @@ function safeJson(v) {
   try { return JSON.stringify(v); } catch { return String(v); }
 }
 
-module.exports = { log, LOG_PATH, LOG_DIR };
+// 进程退出/测试收尾卫生：追加流是一个长生命周期句柄。Windows 上打开的
+// 句柄会让目录项保持存活（unlink 进入 delete-pending 后 rmdir 依旧
+// ENOTEMPTY），曾经让 CI 上「假 HOME 沙箱」的 fs.rmSync 确定性失败。
+// shutdown() 结束流并在操作系统句柄真正关闭后 resolve（500ms 兜底）；
+// 之后的 log() 会透明地重建流，任何时刻调用都安全。
+function shutdown() {
+  return new Promise((resolve) => {
+    if (!stream) return resolve();
+    const s = stream;
+    stream = null;
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    s.on('close', done);
+    try { s.end(); } catch { done(); }
+    const timer = setTimeout(done, 500);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+}
+
+module.exports = { log, shutdown, LOG_PATH, LOG_DIR };

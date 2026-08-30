@@ -249,6 +249,9 @@ const evts = adapter.activityToEvents({
 assert(!evts.some((e) => e.kind === 'needsinput'), 'ModeChange must not produce a needsinput card');
 console.log('✓ adapter：CodeWhale 权限卡身份前缀 + 自动拒绝提示 + humanizeTool + ModeChange 无卡片');
 
-fs.rmSync(tmpDir, { recursive: true, force: true });
-fs.rmSync(fakeHome, { recursive: true, force: true });
+// maxRetries：Windows 上刚退出子进程的句柄有短暂 delete-pending 窗口，
+// 与 e2e-codewhale.js / runtime-ownership.js 收尾同一套防护（本套件无
+// 常开日志流，纯同步写，maxRetries 只是统一加固）。
+fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 console.log('\n✅ PR3 冒烟全部通过');

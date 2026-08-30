@@ -284,7 +284,8 @@ async function main() {
   const decision5 = JSON.parse(r5.out.trim().split('\n').pop());
   assert.strictEqual(decision5.decision, 'ask', `unreachable LLMPET must answer ask, got ${r5.out}`);
   assert(decision5.reason);
-  fs.rmSync(unreachableHome, { recursive: true, force: true });
+  // maxRetries：子进程刚退出时其句柄可能仍处于 delete-pending 窗口内
+  fs.rmSync(unreachableHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   console.log('✓ codewhale-hook：LLMPET 不可达 → ask（fail-closed，绝不空输出=allow）');
 
   // 可达时：写 runtime.json 指向测试 server，危险命令挂起，由我们决定
@@ -414,13 +415,20 @@ async function main() {
   console.log('✓ runtime：stop() 不误删他人记录（first-live-wins 语义）');
 
   console.log('\n✅ E2E 冒烟全部通过（14 组断言）');
-  fs.rmSync(fakeHome, { recursive: true, force: true });
+  // 收尾卫生：本进程内 server 的 listening/error 日志在 fakeHome/.octopus/
+  // octopus.log 上持有一个追加流句柄。Windows 上打开的句柄让 unlink 进入
+  // delete-pending 后 rmdir 依旧 ENOTEMPTY —— 必须先真正关掉句柄再删沙箱
+  // （fork main 的 windows-latest/Node20 CI 曾在此确定性挂掉）。maxRetries
+  // 兑付刚刚退出的 hook 子进程残余句柄的短暂窗口。
+  await require('../backend/log').shutdown();
+  fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   process.exit(0);
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error('E2E FAILED:', e);
   try { server.stop(); } catch {}
-  try { fs.rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+  try { await require('../backend/log').shutdown(); } catch {}
+  try { fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch {}
   process.exit(1);
 });
