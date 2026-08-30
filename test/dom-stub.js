@@ -59,6 +59,7 @@ function makeElement(tag, id) {
   });
   el.getAttribute = (k) => (k in el._attrs ? el._attrs[k] : (k === 'class' ? el.className : null));
   el.setAttribute = (k, v) => { el._attrs[k] = String(v); };
+  el.removeAttribute = (k) => { delete el._attrs[k]; };
   el.addEventListener = (ev, fn) => { (el._listeners[ev] = el._listeners[ev] || []).push(fn); };
   el.removeEventListener = () => {};
   el.dispatch = (ev, arg) => { for (const fn of el._listeners[ev] || []) fn(arg || { stopPropagation() {}, preventDefault() {} }); };
@@ -80,7 +81,7 @@ function makeElement(tag, id) {
   return el;
 }
 
-function createStubWorld() {
+function createStubWorld(options = {}) {
   const elements = new Map(); // id -> element
   const byId = (id) => {
     if (!elements.has(id)) elements.set(id, makeElement('div', id));
@@ -93,26 +94,54 @@ function createStubWorld() {
   const catImg = byId('cat-img');
   catImg.setAttribute('src', '../assets/cat/cat-idle.gif');
 
+  // Only the [data-*] attribute selectors applyStaticI18n() uses. The stub has
+  // no parsed markup, so this scans the elements pet.js actually created — real
+  // data-i18n bindings live in pet.html and are covered by the app itself.
+  const DATA_SEL = /^\[data-([a-z0-9-]+)\]$/;
+  const querySelectorAll = (sel) => {
+    const m = DATA_SEL.exec(String(sel).trim());
+    if (!m) return [];
+    const key = m[1].replace(/-([a-z])/g, (_s, c) => c.toUpperCase());
+    return [...elements.values()].filter((el) => el.dataset && el.dataset[key] !== undefined);
+  };
+
   const document = {
     getElementById: byId,
     createElement: (t) => makeElement(t),
     body: makeElement('body'),
+    documentElement: makeElement('html'),
     activeElement: null,
     elementFromPoint: () => null,
     addEventListener: () => {},
+    querySelectorAll,
   };
 
   // Captured renderer callbacks (registered via window.pet.onX)
-  const handlers = { event: null, stats: null, config: null };
+  const handlers = { event: null, stats: null, config: null, meme: null, travel: null, memeCatalogChanged: null };
   const calls = []; // record of preload calls for assertions
 
   const pet = {
     onEvent: (cb) => { handlers.event = cb; },
     onStats: (cb) => { handlers.stats = cb; },
     onConfig: (cb) => { handlers.config = cb; },
+    onMeme: (cb) => { handlers.meme = cb; },
+    onTravel: (cb) => { handlers.travel = cb; },
+    onMemeCatalogChanged: (cb) => { handlers.memeCatalogChanged = cb; },
     getStats: () => Promise.resolve(null),
     getConfig: () => Promise.resolve(null),
+    getMemeCatalog: () => Promise.resolve({ schemaVersion: 2, items: [] }),
+    triggerMeme: (...a) => { calls.push(['triggerMeme', a]); return Promise.resolve({ ok: true, submitted: true }); },
+    takeOverSession: (...a) => { calls.push(['takeOverSession', a]); return Promise.resolve({ ok: true, code: 'handoff-launched' }); },
+    getTravel: () => Promise.resolve({ active: null, latest: null, growth: { totalTokens: 0, completed: 0, rank: {} }, templates: [] }),
+    getTravelPostcards: () => Promise.resolve([]),
+    startTravel: (...a) => { calls.push(['startTravel', a]); return Promise.resolve({ ok: true }); },
+    wanderTravel: () => { calls.push(['wanderTravel']); return Promise.resolve({ ok: true }); },
+    cancelTravel: () => { calls.push(['cancelTravel']); return Promise.resolve({ ok: true }); },
     getWinPos: () => Promise.resolve([0, 0]),
+    getWindowMetrics: () => Promise.resolve({
+      window: { x: 0, y: 0, width: 320, height: 340 },
+      workArea: { x: 0, y: 0, width: 1440, height: 900 },
+    }),
     setWinPos: (...a) => calls.push(['setWinPos', a]),
     setPetSize: (...a) => calls.push(['setPetSize', a]),
     setIgnoreMouse: (...a) => calls.push(['setIgnoreMouse', a]),
@@ -120,12 +149,16 @@ function createStubWorld() {
     toggleMute: () => calls.push(['toggleMute']),
     openPanel: () => calls.push(['openPanel']),
     openLog: () => calls.push(['openLog']),
+    openDragLog: () => calls.push(['openDragLog']),
     quit: () => calls.push(['quit']),
     launchClaude: () => calls.push(['launchClaude']),
     focusSession: (...a) => calls.push(['focusSession', a]),
+    copySessionId: (...a) => { calls.push(['copySessionId', a]); return Promise.resolve(true); },
+    focusPet: () => calls.push(['focusPet']),
     blurPet: () => calls.push(['blurPet']),
     decidePermission: (...a) => calls.push(['decidePermission', a]),
     petLog: () => {},
+    petDragTrace: (...a) => calls.push(['petDragTrace', a]),
   };
 
   // Controllable clock: advance() shifts Date.now() so transient windows can be
@@ -136,13 +169,19 @@ function createStubWorld() {
     static now() { return RealDate.now() + clock.offset; }
   }
 
+  const windowListeners = {};
   const window = {
     pet,
     OctoIcons: undefined,
     AudioContext: undefined,
     webkitAudioContext: undefined,
-    addEventListener: () => {},
+    addEventListener: (ev, fn) => { (windowListeners[ev] = windowListeners[ev] || []).push(fn); },
+    ...(options.window || {}),
   };
+
+  for (const [id, rect] of Object.entries(options.elementRects || {})) {
+    byId(id).getBoundingClientRect = () => ({ ...rect });
+  }
 
   const sandbox = {
     document,
@@ -167,15 +206,22 @@ function createStubWorld() {
     isFinite,
     parseInt,
     parseFloat,
+    // pet.js 启动即读 ?agent=（双宠身份）；沙箱按单宠(all)跑
+    URLSearchParams,
+    location: { search: '' },
   };
   sandbox.globalThis = sandbox;
-  return { sandbox, elements: byId, handlers, calls, clock, document, window };
+  const dispatchWindow = (ev, payload = {}) => {
+    for (const fn of windowListeners[ev] || []) fn({ type: ev, ...payload });
+  };
+  return { sandbox, elements: byId, handlers, calls, clock, document, window, dispatchWindow };
 }
 
 // Load renderer/pet.js (and anything else, e.g. a future shared module) into
 // the stub world. Returns the world for driving + assertions.
-function loadRenderer(files) {
-  const world = createStubWorld();
+function loadRenderer(files, options = {}) {
+  const world = createStubWorld(options);
+  if (typeof options.search === 'string') world.sandbox.location.search = options.search;
   vm.createContext(world.sandbox);
   for (const f of files) {
     const code = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');

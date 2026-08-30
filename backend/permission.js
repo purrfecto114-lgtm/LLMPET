@@ -16,122 +16,112 @@
 const crypto = require('crypto');
 const { SERVER_HEADER, SERVER_ID } = require('./transport');
 const { log } = require('./log');
+const transcript = require('./transcript');
 
-// Tools Claude Code may ask permission for but which are pure orchestration,
-// read-only, or low-risk — auto-allow so the pet never blocks them.
+// Tools Claude Code may ask permission for but which are pure orchestration —
+// auto-allow so the pet never blocks them.
 const PASSTHROUGH_TOOLS = new Set([
   'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskStop', 'TaskOutput',
-  // 只读工具：读取文件、搜索路径、无副作用的操作
-  'Read', 'Glob', 'Grep', 'LS',
-  // 低风险工具：网络搜索（不写本地）、内部待办状态
-  'WebSearch', 'TodoWrite',
 ]);
-
-// 条件性放行：工具名 + 输入参数检查，仅在安全条件下自动放行。
-// RETURN VALUES:
-//   null        → 不做条件判断（走完整权限流程）
-//   true        → 自动 allow（条件满足）
-//   false       → 自动 deny（条件明确不满足，安全拒绝）
-function checkConditionalPassthrough(toolName, toolInput) {
-  const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
-
-  if (toolName === 'WebFetch') {
-    // WebFetch: 仅允许 HTTP(S) GET 请求；阻止 file:// 或其它协议
-    const url = String(input.url || '').trim();
-    if (!url) return null;
-    if (/^https?:\/\//i.test(url)) return true;
-    return false; // 非 http(s) URL → 拒绝
-  }
-
-  if (toolName === 'Bash') {
-    const cmd = String(input.command || '').trim();
-    if (!cmd) return null;
-    // 只读命令白名单：读取/搜索/日志/状态/时间/环境
-    const SAFE_PATTERNS = [
-      /^(ls|cat|head|tail|less|wc|pwd|echo|date|whoami|uname|which|type|du|df|env|printenv|arch|hostname)\b/,
-      /^(find|grep|rg|ag|fd|locate|tree)\b/,
-      /^(git\s+(status|log|diff|show|branch|remote|describe|rev-parse|config|help))\b/,
-    ];
-    return SAFE_PATTERNS.some((re) => re.test(cmd)) ? true : null;
-  }
-
-  return null; // 不属于已知条件性放行类型 → 走正常流程
-}
 
 // Resolve a hair before CC's own 600s hook timeout so a forgotten bubble lets
 // CC fall back to its in-terminal prompt instead of hanging.
 const AUTO_CLOSE_MS = 8 * 60 * 1000;
-const MAX_PENDING = 128;
-const MAX_DUPES_PER_REQUEST = 8;
-const MAX_ANSWER_CHARS = 4096;
-const MAX_FEEDBACK_CHARS = 4096;
+// Claude's own CLI/Desktop prompt can be answered while our HTTP hook is still
+// parked. That answer is written to the session transcript, but Claude does not
+// necessarily close the hook connection, so the pet card used to stay visible.
+// Poll only while requests are pending; 350ms feels immediate without keeping a
+// permanent filesystem watcher alive.
+const EXTERNAL_ANSWER_POLL_MS = 350;
+const TOOL_USE_LOOKBACK_MS = 10 * 1000;
 
 // AskUserQuestion (elicitation): Claude Code sends it through the same
 // PermissionRequest HTTP hook with tool_input.questions[]. We answer it by
 // replying { behavior:"allow", updatedInput:{...toolInput, answers} } where
 // answers maps each question text → the chosen option label / custom text.
 
-function cleanText(value, max) {
-  const text = String(value == null ? '' : value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
-  return text.length > max ? text.slice(0, max) : text;
-}
-
-function boundedClone(value, depth = 0) {
-  if (depth > 5) return null;
-  if (Array.isArray(value)) return value.slice(0, 32).map((v) => boundedClone(v, depth + 1));
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const key of Object.keys(value).slice(0, 48)) {
-      if (key === '__proto__' || key === 'prototype' || key === 'constructor') continue;
-      out[key] = boundedClone(value[key], depth + 1);
-    }
-    return out;
-  }
-  if (typeof value === 'string') return value.length > 4096 ? value.slice(0, 4096) : value;
-  if (value == null || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  return null;
-}
-
 // Clean the questions for the UI (titles + descriptions per option).
 function parseElicitationQuestions(toolInput) {
   const qs = toolInput && Array.isArray(toolInput.questions) ? toolInput.questions : [];
   return qs.slice(0, 10).map((q) => {
     if (!q || typeof q !== 'object') return null;
-    const question = cleanText(q.question || q.prompt || '', 1000);
+    const question = String(q.question || q.prompt || '').trim();
     if (!question) return null;
     const options = Array.isArray(q.options) ? q.options.slice(0, 12).map((o) => {
-      if (typeof o === 'string') return { label: cleanText(o, 500), description: '' };
-      if (o && typeof o === 'object') return { label: cleanText(o.label || '', 500), description: cleanText(o.description || '', 1000) };
+      if (typeof o === 'string') return { label: o, description: '' };
+      if (o && typeof o === 'object') return { label: String(o.label || '').trim(), description: String(o.description || '').trim() };
       return null;
     }).filter((o) => o && o.label) : [];
-    return { header: cleanText(q.header || '', 200), question, options, multiSelect: q.multiSelect === true };
+    return { header: String(q.header || '').trim(), question, options, multiSelect: q.multiSelect === true };
   }).filter(Boolean);
 }
 
 // Build the updatedInput Claude Code applies as the answer.
 function buildElicitationUpdatedInput(toolInput, answers) {
-  const input = boundedClone(toolInput && typeof toolInput === 'object' ? toolInput : {});
-  const questions = Array.isArray(input.questions) ? input.questions.slice(0, 10) : [];
-  const norm = Object.create(null);
+  const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  const norm = {};
   for (const q of questions) {
     if (!q || typeof q.question !== 'string' || !q.question) continue;
     const a = answers && Object.prototype.hasOwnProperty.call(answers, q.question) ? answers[q.question] : undefined;
-    if (typeof a === 'string' && a.trim()) {
-      Object.defineProperty(norm, q.question, { value: cleanText(a, MAX_ANSWER_CHARS), enumerable: true, configurable: true });
-    }
+    if (typeof a === 'string' && a.trim()) norm[q.question] = a.trim();
   }
   return { ...input, questions, answers: norm };
 }
 
-// Identity of a permission request, for collapsing duplicate re-sends. Two genuinely
-// separate asks never overlap (CC waits for the answer first), so an identical sig
-// while one is still pending == a retry, safe to merge.
+// Identity of a permission request, for collapsing duplicate re-sends. Distinct
+// requests can overlap when parallel/background agents share a session_id, so
+// only an identical session+tool+input signature is merged as the same retry.
+function stableJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+  }
+  if (value === undefined) return 'null';
+  try { return JSON.stringify(value); } catch { return 'null'; }
+}
+
 function requestSig(sessionId, toolName, toolInput) {
-  let inp = '';
-  try { inp = JSON.stringify(toolInput); } catch { inp = ''; }
-  if (inp.length > 2000) inp = inp.slice(0, 2000);
-  return sessionId + '|' + toolName + '|' + inp;
+  const raw = `${sessionId || ''}\0${toolName || ''}\0${stableJson(toolInput || {})}`;
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+function contentBlocks(entry) {
+  const content = entry && entry.message ? entry.message.content : entry && entry.content;
+  return Array.isArray(content) ? content : [];
+}
+
+// PermissionRequest deliberately omits tool_use_id. Recover it from the nearby
+// assistant tool_use using the exact request signature, then wait for the
+// matching user tool_result. Timestamp gating prevents an older identical ask
+// in the same long-running session from closing a new card.
+function findMatchingToolUseId(entries, entry) {
+  if (!Array.isArray(entries) || !entry) return null;
+  const minTs = entry.createdAt - TOOL_USE_LOOKBACK_MS;
+  let found = null;
+  for (const item of entries) {
+    if (!item || item.type !== 'assistant') continue;
+    if (item.sessionId && item.sessionId !== entry.sessionId) continue;
+    const ts = Date.parse(item.timestamp || '') || 0;
+    if (ts < minTs) continue;
+    for (const block of contentBlocks(item)) {
+      if (!block || block.type !== 'tool_use' || !block.id || block.name !== entry.toolName) continue;
+      if (requestSig(entry.sessionId, block.name, block.input) === entry.sig) found = block.id;
+    }
+  }
+  return found;
+}
+
+function hasToolResult(entries, entry, toolUseId) {
+  if (!Array.isArray(entries) || !entry || !toolUseId) return false;
+  for (const item of entries) {
+    if (!item || item.type !== 'user') continue;
+    if (item.sessionId && item.sessionId !== entry.sessionId) continue;
+    const ts = Date.parse(item.timestamp || '') || 0;
+    if (ts && ts < entry.createdAt - TOOL_USE_LOOKBACK_MS) continue;
+    if (contentBlocks(item).some((block) => block && block.type === 'tool_result' && block.tool_use_id === toolUseId)) return true;
+  }
+  return false;
 }
 
 function sendPermissionResponse(res, decision) {
@@ -150,14 +140,49 @@ function sendPermissionResponse(res, decision) {
 function createPermissions(options = {}) {
   const onAdded = typeof options.onAdded === 'function' ? options.onAdded : () => {};
   const onChange = typeof options.onChange === 'function' ? options.onChange : () => {};
-  // shouldDrop() → true when DND/disabled: let CC fall back to its own prompt.
+  // shouldDrop(parsed) → true only when another surface intentionally owns the
+  // request and wants Claude Code to fall back to its terminal prompt.
   const shouldDrop = typeof options.shouldDrop === 'function' ? options.shouldDrop : () => false;
 
   /** @type {Map<string, object>} */
   const pending = new Map();
+  let externalAnswerTimer = null;
+
+  function stopExternalAnswerPollIfIdle() {
+    if (!externalAnswerTimer) return;
+    if ([...pending.values()].some((entry) => entry.transcriptPath)) return;
+    clearInterval(externalAnswerTimer);
+    externalAnswerTimer = null;
+  }
 
   function destroy(res) {
     try { res.destroy(); } catch {}
+  }
+
+  // Keep a pending card alive while any duplicate/retry HTTP connection for
+  // the same PermissionRequest is still open. Claude Code can briefly have
+  // more than one identical hook connection during retries or when an old
+  // duplicate hook is still installed; losing the first connection must not
+  // turn into a deny for the surviving copy.
+  function attachPrimary(entry, res) {
+    entry.res = res;
+    entry.abortHandler = () => {
+      if (!pending.has(entry.id) || res.writableFinished) return;
+      while (entry.dupes.length) {
+        const next = entry.dupes.shift();
+        try { if (next.res && next.closeHandler) next.res.off('close', next.closeHandler); } catch {}
+        if (!next.res || next.res.destroyed || next.res.writableEnded) continue;
+        log('perm', `primary disconnected; promote dup for id=${entry.id.slice(0, 8)}`);
+        attachPrimary(entry, next.res);
+        return;
+      }
+      resolveEntry(entry, 'no-decision', 'Client disconnected');
+    };
+    if (!res || res.destroyed || res.writableEnded) {
+      entry.abortHandler();
+      return;
+    }
+    try { res.on('close', entry.abortHandler); } catch {}
   }
 
   // Resolve a pending entry: write the decision (or drop), clean up, notify.
@@ -197,69 +222,74 @@ function createPermissions(options = {}) {
     }
     const dn = entry.dupes && entry.dupes.length ? ` (+${entry.dupes.length} dup)` : '';
     log('perm', `resolve id=${entry.id.slice(0, 8)} ${entry.toolName} -> ${behavior}${dn}${message ? ' (' + message + ')' : ''}`);
+    stopExternalAnswerPollIfIdle();
     onChange();
     return true;
+  }
+
+  function reconcileExternalAnswers() {
+    if (!pending.size) { stopExternalAnswerPollIfIdle(); return; }
+    const byPath = new Map();
+    for (const entry of pending.values()) {
+      if (!entry.transcriptPath) continue;
+      if (!byPath.has(entry.transcriptPath)) byPath.set(entry.transcriptPath, transcript.readTail(entry.transcriptPath));
+      const entries = byPath.get(entry.transcriptPath);
+      if (!Array.isArray(entries)) continue;
+      if (!entry.toolUseId) entry.toolUseId = findMatchingToolUseId(entries, entry);
+      if (entry.toolUseId && hasToolResult(entries, entry, entry.toolUseId)) {
+        resolveEntry(entry, 'no-decision', 'Answered in Claude');
+      }
+    }
+  }
+
+  function ensureExternalAnswerPoll() {
+    if (externalAnswerTimer) return;
+    externalAnswerTimer = setInterval(reconcileExternalAnswers, EXTERNAL_ANSWER_POLL_MS);
+    if (externalAnswerTimer.unref) externalAnswerTimer.unref();
   }
 
   // Ingress from the HTTP /permission route. `parsed` is already normalized by
   // server.js: { toolName, toolInput, suggestions, sessionId, agentId, headless }.
   function addPermission(res, parsed) {
-    // DND / agent disabled → don't answer; CC shows its own terminal prompt.
-    if (shouldDrop()) { destroy(res); return; }
+    // An explicitly external surface may opt out before a card is created.
+    if (shouldDrop(parsed)) { destroy(res); return; }
 
     const toolName = parsed.toolName || 'Unknown';
     const sessionId = parsed.sessionId || 'default';
 
-    // Pure orchestration / read-only / low-risk tools → auto-allow.
+    // Pure orchestration tools → auto-allow.
     if (PASSTHROUGH_TOOLS.has(toolName)) {
       sendPermissionResponse(res, { behavior: 'allow' });
       return;
     }
-
-    // Conditional passthrough: check tool + input for safe auto-allow/deny.
-    const condResult = checkConditionalPassthrough(toolName, parsed.toolInput);
-    if (condResult === true) {
-      sendPermissionResponse(res, { behavior: 'allow' });
-      log('perm', `cond-allow ${toolName} session=${String(sessionId).slice(-6)}`);
-      return;
-    }
-    if (condResult === false) {
-      sendPermissionResponse(res, { behavior: 'deny', message: 'Unsafe input for conditional tool' });
-      log('perm', `cond-deny ${toolName} session=${String(sessionId).slice(-6)}`);
-      return;
-    }
-
     // Headless (claude -p) → can't ask a human; auto-deny.
     if (parsed.headless === true) {
       sendPermissionResponse(res, { behavior: 'deny', message: 'Non-interactive session; auto-denied' });
-      log('perm', `headless-deny ${toolName} session=${String(sessionId).slice(-6)}`);
       return;
     }
 
-    const toolInput = boundedClone(parsed.toolInput && typeof parsed.toolInput === 'object' ? parsed.toolInput : {});
+    const toolInput = parsed.toolInput && typeof parsed.toolInput === 'object' ? parsed.toolInput : {};
     const isElicitation = toolName === 'AskUserQuestion';
 
     // De-dup retries: if an IDENTICAL request (same session+tool+input) is already
-    // pending and unanswered, this is a re-send (not a genuine new ask — Claude Code
-    // waits for the answer before issuing the next one). Attach this connection to
-    // the existing card instead of spawning a second one; resolveEntry answers all.
+    // pending and unanswered, attach this connection to the existing card.
+    // Different inputs remain separate because parallel agents can legitimately
+    // wait on more than one permission inside the same session.
     const sig = requestSig(sessionId, toolName, toolInput);
     for (const e of pending.values()) {
       if (e.sig === sig) {
-        if (e.dupes.length >= MAX_DUPES_PER_REQUEST) { destroy(res); return; }
         const dup = { res, closeHandler: null };
         dup.closeHandler = () => { const i = e.dupes.indexOf(dup); if (i >= 0) e.dupes.splice(i, 1); };
         e.dupes.push(dup);
         try { res.on('close', dup.closeHandler); } catch {}
         log('perm', `dup -> ${e.id.slice(0, 8)} ${toolName} (${e.dupes.length} pending copies)`);
+        if (!e.transcriptPath && typeof parsed.transcriptPath === 'string') {
+          e.transcriptPath = parsed.transcriptPath;
+          ensureExternalAnswerPoll();
+          reconcileExternalAnswers();
+        }
         return;
       }
-    }
-
-    if (pending.size >= MAX_PENDING) {
-      destroy(res); // Claude falls back to its native terminal permission prompt.
-      log('perm', `queue-full ${toolName} session=${String(sessionId).slice(-6)}`);
-      return;
     }
 
     const entry = {
@@ -276,25 +306,29 @@ function createPermissions(options = {}) {
       suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
       resolvedSuggestion: null,
       agentId: parsed.agentId || 'claude-code',
+      transcriptPath: typeof parsed.transcriptPath === 'string' ? parsed.transcriptPath : null,
+      toolUseId: null,
       createdAt: Date.now(),
       timer: null,
       abortHandler: null,
     };
 
-    // CC disconnected before deciding → treat as deny.
-    entry.abortHandler = () => {
-      if (res.writableFinished) return;
-      resolveEntry(entry, 'deny', 'Client disconnected');
-    };
-    try { res.on('close', entry.abortHandler); } catch {}
-
+    pending.set(entry.id, entry);
+    attachPrimary(entry, res);
+    // attachPrimary may immediately remove an already-disconnected response.
+    if (!pending.has(entry.id)) return;
     entry.timer = setTimeout(() => resolveEntry(entry, 'no-decision', 'auto-close'), AUTO_CLOSE_MS);
     if (entry.timer.unref) entry.timer.unref();
 
-    pending.set(entry.id, entry);
     log('perm', `pending id=${entry.id.slice(0, 8)} ${toolName} session=${String(sessionId).slice(-6)}`);
     try { onAdded(entry); } catch (err) { log('perm', 'onAdded error:', err.message); }
     onChange();
+    if (entry.transcriptPath) {
+      ensureExternalAnswerPoll();
+      // Capture the nearby tool_use immediately. A later giant tool result can
+      // push that assistant line out of transcript.readTail's bounded window.
+      reconcileExternalAnswers();
+    }
   }
 
   // Frontend decision:
@@ -314,13 +348,12 @@ function createPermissions(options = {}) {
     // ExitPlanMode: reject with feedback → deny carrying the feedback as the
     // message so Claude revises the plan; approve → allow.
     if (behavior && typeof behavior === 'object' && behavior.type === 'plan-feedback') {
-      const fb = cleanText(behavior.feedback || '', MAX_FEEDBACK_CHARS);
+      const fb = String(behavior.feedback || '').trim();
       return resolveEntry(entry, 'deny', fb || 'Plan rejected — please revise');
     }
     // "Always allow" suggestion button → allow + persist the rule via updatedPermissions.
     if (typeof behavior === 'string' && behavior.startsWith('suggestion:')) {
-      const rawIndex = behavior.slice('suggestion:'.length);
-      const i = /^\d{1,3}$/.test(rawIndex) ? Number(rawIndex) : -1;
+      const i = parseInt(behavior.slice('suggestion:'.length), 10);
       const sg = Array.isArray(entry.suggestions) ? entry.suggestions[i] : null;
       if (sg && typeof sg === 'object') {
         entry.resolvedSuggestion = { ...sg, destination: sg.destination || 'localSettings', behavior: sg.behavior || 'allow' };
@@ -330,14 +363,18 @@ function createPermissions(options = {}) {
     return resolveEntry(entry, behavior === 'allow' ? 'allow' : 'deny');
   }
 
-  // When the user clearly answered in the terminal, sweep stale bubbles for that
-  // session, so we clear any stale bubbles still open for it.
-  const SWEEP_EVENTS = new Set(['PostToolUse', 'PostToolUseFailure', 'Stop', 'StopFailure', 'UserPromptSubmit', 'SessionEnd']);
+  // Only an actual session end proves every pending card for that session is
+  // stale. PostToolUse / Stop / UserPromptSubmit are not proof: parallel and
+  // background agents share the same session_id, so their lifecycle events
+  // must never remove another agent's live permission card. If the user answers
+  // in the terminal, Claude Code closes the held HTTP connection and the close
+  // handler above performs the no-decision cleanup.
+  const SWEEP_EVENTS = new Set(['SessionEnd']);
   function sweepForSessionEvent(sessionId, event) {
     if (!SWEEP_EVENTS.has(event)) return;
     for (const entry of [...pending.values()]) {
       if (entry.sessionId === sessionId) {
-        resolveEntry(entry, 'deny', 'User answered in terminal');
+        resolveEntry(entry, 'no-decision', 'Session ended');
       }
     }
   }
@@ -366,6 +403,7 @@ function createPermissions(options = {}) {
 
   function cleanup() {
     for (const entry of [...pending.values()]) resolveEntry(entry, 'deny', 'Pet is quitting');
+    if (externalAnswerTimer) { clearInterval(externalAnswerTimer); externalAnswerTimer = null; }
   }
 
   return {
@@ -380,79 +418,4 @@ function createPermissions(options = {}) {
   };
 }
 
-/**
- * Build a permission.allow rule for Claude Code's settings.json.
- * Returns an object suitable for inserting into `{ permissions: { allow: [...] } }`.
- *
- * @param {string} toolName - e.g. 'Bash', 'Edit', 'Write'
- * @param {object} options
- * @param {string} [options.command] - For Bash: command prefix to match (e.g. 'npm run')
- * @param {boolean} [options.edit] - For Edit/Write: allow all edits (no file pattern filter)
- * @param {string} [options.filePattern] - Glob pattern for files (e.g. 'src/*.ts')
- * @returns {object} settings.json allow rule
- */
-function buildAllowRule(toolName, options = {}) {
-  const rule = { toolName };
-  if (options.command) {
-    rule.command = String(options.command).slice(0, 256);
-  }
-  if (options.edit === true) {
-    rule.edit = true;
-  }
-  if (options.filePattern) {
-    rule.filePattern = String(options.filePattern).slice(0, 512);
-  }
-  return rule;
-}
-
-/**
- * Write a persistent allow rule to ~/.claude/settings.json.
- * Creates the file/`permissions.allow` array if absent.  Merges by toolName
- * (replaces an existing rule for the same tool).  Atomic write via tmp+rename.
- *
- * @param {object} rule - output of buildAllowRule()
- * @returns {boolean} true if the rule was written (or already present)
- */
-function writeAllowRule(rule) {
-  const fs = require('fs');
-  const os = require('os');
-  const path = require('path');
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-
-  let settings;
-  try {
-    const raw = fs.readFileSync(settingsPath, 'utf8');
-    settings = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-  } catch (err) {
-    if (err.code === 'ENOENT') settings = {};
-    else return false;
-  }
-  if (!settings || typeof settings !== 'object') return false;
-  if (!settings.permissions || typeof settings.permissions !== 'object') settings.permissions = {};
-  if (!Array.isArray(settings.permissions.allow)) settings.permissions.allow = [];
-
-  const existing = settings.permissions.allow.findIndex((r) => r && r.toolName === rule.toolName);
-  if (existing >= 0) {
-    // Already present – skip if identical, update if changed
-    const cur = settings.permissions.allow[existing];
-    if (JSON.stringify(cur) === JSON.stringify(rule)) return true;
-    settings.permissions.allow[existing] = rule;
-  } else {
-    settings.permissions.allow.push(rule);
-  }
-
-  try {
-    fs.mkdirSync(path.dirname(settingsPath), { recursive: true, mode: 0o700 });
-    try { fs.chmodSync(path.dirname(settingsPath), 0o700); } catch {}
-    const tmp = path.join(path.dirname(settingsPath), `.settings.${process.pid}.${Date.now()}.tmp`);
-    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), { encoding: 'utf8', mode: 0o600 });
-    try { fs.chmodSync(tmp, 0o600); } catch {}
-    fs.renameSync(tmp, settingsPath);
-    try { fs.chmodSync(settingsPath, 0o600); } catch {}
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-module.exports = { createPermissions, sendPermissionResponse, PASSTHROUGH_TOOLS, MAX_PENDING, MAX_DUPES_PER_REQUEST, checkConditionalPassthrough, buildAllowRule, writeAllowRule, _boundedClone: boundedClone, _buildElicitationUpdatedInput: buildElicitationUpdatedInput };
+module.exports = { createPermissions, sendPermissionResponse, PASSTHROUGH_TOOLS };

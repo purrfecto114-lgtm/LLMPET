@@ -41,25 +41,20 @@ const VALID_STATES = new Set(States.VALID_STATES); // states the /state route ac
 const BUSY_STATES = new Set(States.BUSY_STATES);
 
 const DONE_EVENTS = new Set(['Stop']);
-const WORK_START_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SubagentStart']);
+// TaskStarted: Codex 回合开始（rollout 的 task_started）——同样属于「新工作开始」，
+// 要清掉上一轮的完成徽标；Claude 路径永远不会发这个事件名。
+const WORK_START_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SubagentStart', 'TaskStarted']);
 
 // Stale-cleanup thresholds (ms). An idle session whose terminal process is still
 // ALIVE stays visible (never auto-slept or removed) — so every open Claude
 // session keeps showing. We only retire sessions whose terminal is gone, or that
 // have been silent far too long.
-const WORKING_STALE_MS = 5 * 60 * 1000;   // W25: stuck working/thinking → drop to idle after 5min.
-// Was 60s (W24), but too short for CodeWhale background shell tasks
-// (exec_shell background=true / task_shell_start) which return immediately
-// with a task_id but keep running in the background for minutes.
-// 5 minutes is a balance: long enough for typical background tasks, short
-// enough to recover from genuinely stuck sessions.
+const WORKING_STALE_MS = 5 * 60 * 1000;   // stuck working/thinking → drop to idle (keep visible)
 const CWD_ACTIVE_MS = 10 * 60 * 1000;     // 同 cwd 近期活跃窗口：期间新 SessionStart 视为进入既有工作，不欢迎
 const DETACHED_REMOVE_MS = 30 * 1000;     // terminal pid dead → remove after a short grace
 const SESSION_STALE_MS = 30 * 60 * 1000;  // no live terminal + this idle → remove; ended (sleeping) → remove
 const BACKFILL_MAX_AGE_MS = SESSION_STALE_MS; // on boot, seed sessions whose transcript changed within this
 const BACKFILL_MAX = 15;                  // cap seeded sessions
-const BACKFILL_SCAN_MAX = 5000;           // startup guard for very large transcript trees
-const MAX_SESSIONS = 256;                 // bound long-running memory/UI growth
 
 // The session's Claude Code transcript file. Prefer the real path CC hands us
 // (forwarded by the hook / captured during backfill); only fall back to deriving
@@ -96,7 +91,8 @@ function deriveBadge(s) {
   const ev = latest && latest.event;
   // A failure wins regardless of the current state word (octopus stores the
   // 'error' state, unlike clawd which stores idle, so check this first).
-  if (ev === 'StopFailure' || ev === 'PostToolUseFailure' || ev === 'ApiError') return 'interrupted';
+  // TurnAborted = Codex 回合被用户叫停（ESC），和 Claude 的 ESC 中断同一个徽标。
+  if (ev === 'StopFailure' || ev === 'PostToolUseFailure' || ev === 'ApiError' || ev === 'TurnAborted') return 'interrupted';
   if (s.state !== 'idle' && s.state !== 'sleeping') return 'running';
   if (s.state === 'sleeping') return 'idle';
   // 只认 requiresCompletionAck（真完成才置位）。之前 DONE_EVENTS.has(ev) 兜底会
@@ -113,25 +109,6 @@ function createCore(options = {}) {
   /** @type {Map<string, object>} */
   const sessions = new Map();
   let cleanupTimer = null;
-  // #r7-fix: pendingBackfill gates the deferred initial backfill so a rapid
-  // stopStaleCleanup() (e.g. app quit during boot) cancels the pending
-  // setImmediate callback instead of running filesystem scans after shutdown.
-  let pendingBackfill = false;
-
-  function ensureSessionCapacity(incomingId) {
-    if (sessions.has(incomingId) || sessions.size < MAX_SESSIONS) return;
-    const candidates = [...sessions.values()].sort((a, b) => {
-      const aBusy = BUSY_STATES.has(a.state) ? 1 : 0;
-      const bBusy = BUSY_STATES.has(b.state) ? 1 : 0;
-      if (aBusy !== bBusy) return aBusy - bBusy; // retire idle/ended first
-      return (a.updatedAt || 0) - (b.updatedAt || 0);
-    });
-    const victim = candidates[0];
-    if (victim) {
-      sessions.delete(victim.id);
-      log('core', `session cap reached; retired ${String(victim.id).slice(0, 8)}`);
-    }
-  }
 
   function setField(s, key, value) {
     if (value === undefined || value === null) return;
@@ -144,13 +121,11 @@ function createCore(options = {}) {
     const now = Date.now();
     const prev = sessions.get(id);
     const isNew = !prev;
-    if (isNew) ensureSessionCapacity(id);
     const s = prev || { id, createdAt: now, state: 'idle', recentEvents: [] };
     const prevState = s.state;
 
     // Merge identity / focus fields only when provided (never clobber with null).
     setField(s, 'agentId', f.agentId);
-    setField(s, 'provider', f.provider);
     setField(s, 'cwd', f.cwd);
     setField(s, 'transcriptPath', f.transcriptPath);
     setField(s, 'sourcePid', f.sourcePid);
@@ -158,13 +133,25 @@ function createCore(options = {}) {
     setField(s, 'editor', f.editor);
     setField(s, 'tmuxSocket', f.tmuxSocket);
     setField(s, 'tmuxClient', f.tmuxClient);
+    setField(s, 'terminalApp', f.terminalApp);
+    setField(s, 'terminalTty', f.terminalTty);
     setField(s, 'wtHwnd', f.wtHwnd);
     setField(s, 'ghosttyTerminalId', f.ghosttyTerminalId);
+    setField(s, 'originator', f.originator);
     setField(s, 'model', f.model);
+    setField(s, 'sessionRole', f.sessionRole);
+    setField(s, 'travelAgent', f.travelAgent);
+    setField(s, 'backgroundTasksCount', Number(f.backgroundTasksCount) || 0);
+    setField(s, 'sessionCronsCount', Number(f.sessionCronsCount) || 0);
+    if (typeof f.stopHookActive === 'boolean') s.stopHookActive = f.stopHookActive;
     if (typeof f.headless === 'boolean') s.headless = f.headless;
     if (f.sessionTitle != null) s.sessionTitle = f.sessionTitle;
     if (f.contextUsage) s.contextUsage = f.contextUsage;
     if (f.errorType) s.errorType = f.errorType; // last API/server error kind
+    // Codex request_user_input 的只读镜像。它必须跨过 core 进入
+    // adapter，否则 watcher 虽然看见了选择对话，前端只会得到一张
+    // 没有选项的通用“去回复”卡。
+    if (f.codexChoice && typeof f.codexChoice === 'object') s.codexChoice = f.codexChoice;
     // Pending emotion (per-event, one-shot). Adapter consumes it when it ships
     // the user-turn / say event; we clear AFTER consumption (see buildSnapshot
     // does not carry these — they live only on the freshly-updated session
@@ -185,10 +172,18 @@ function createCore(options = {}) {
     let resolvedState = VALID_STATES.has(incomingState) ? incomingState : 'idle';
     let realCompletion = false;
 
-    // Subagent juggling: hold the "juggling" state through the subagent's tool
-    // calls instead of letting the next working event overwrite it after one
-    // step. Released by SubagentStop/UserPromptSubmit/Stop (non-tool events).
-    if (prevState === 'juggling' && (event === 'PreToolUse' || event === 'PostToolUse')) {
+    // Subagent juggling: hold the "juggling" state through nested tool calls and
+    // reasoning rows. Codex/dsh keep writing these while child agents are alive;
+    // letting one row overwrite the state made the dedicated expression vanish.
+    // Older Claude Code may expose only PreToolUse(Task|Agent) + matching
+    // PostToolUse, without SubagentStop, so that matching successful result is
+    // also a release boundary when the provider explicitly reports `working`.
+    const fallbackSubagentDone = event === 'PostToolUse'
+      && incomingState === 'working'
+      && (f.toolName === 'Task' || f.toolName === 'Agent');
+    if (prevState === 'juggling'
+        && !fallbackSubagentDone
+        && (event === 'PreToolUse' || event === 'PostToolUse' || event === 'Reasoning')) {
       resolvedState = 'juggling';
     }
 
@@ -216,7 +211,7 @@ function createCore(options = {}) {
 
     // SessionEnd（含 /clear → sweeping）标记会话已结束：之后无论落在什么状态，
     // 陈旧清理都会按「已结束」回收，不再因终端 pid 还活着而永久留在列表里。
-    if (event === 'SessionEnd') s.ended = true;
+    if (event === 'SessionEnd' && f.externalResume !== true) s.ended = true;
     else if (WORK_START_EVENTS.has(event) || event === 'SessionStart') s.ended = false;
 
     // 「同项目已有活跃会话」判定：点进正在执行的任务时，ccd 可能 fork 出全新
@@ -235,6 +230,10 @@ function createCore(options = {}) {
     }
 
     s.state = resolvedState;
+    // Codex 端回答后，rollout 会继续写 function_call_output / 下一个
+    // 活动事件。只要状态离开 notification，就精确清掉旧卡，
+    // 让用户在 Codex 客户端或 CLI 里选完后 LLMPET 自动关闭弹窗。
+    if (resolvedState !== 'notification' && !f.codexChoice) s.codexChoice = null;
     s.sweepError = false; // 任何真实 hook 事件到达都接管状态，巡检错误标记作废
     s.lastEvent = { rawEvent: event || null, at: now };
     if (f.toolName) s.lastEventTool = f.toolName;
@@ -255,6 +254,49 @@ function createCore(options = {}) {
     return s;
   }
 
+  // Silent insert for watcher backfill（Codex rollout / 其它外部来源）：像
+  // backfillFromTranscripts 一样直接入库，不走 updateSession —— 不触发欢迎、
+  // 庆祝等 activity 事件，启动时把「已存在的会话」原样摆进列表。
+  function seedSession(fields) {
+    if (!fields || !fields.id || sessions.has(fields.id)) return null;
+    const now = Date.now();
+    const s = {
+      state: 'idle', recentEvents: [], createdAt: now, updatedAt: now,
+      ...fields,
+    };
+    sessions.set(s.id, s);
+    onDirty();
+    return s;
+  }
+
+  // Context-only refresh（Codex 的 token_count 事件）：不动状态机、不进
+  // recentEvents（null 事件会掩盖 deriveBadge 对最近失败事件的判定）。
+  function setContextUsage(sid, cu) {
+    const s = sessions.get(sid);
+    if (!s || !cu) return;
+    s.contextUsage = cu;
+    onDirty();
+  }
+
+  // 纯展示字段的刷新（dsh 的 session/title、request/header 里的模型名）：同样
+  // 绕开状态机与 recentEvents —— 换个标题不该清掉「完成」徽标，也不该把最近
+  // 一次失败事件顶出历史。
+  function setSessionMeta(sid, fields) {
+    const s = sessions.get(sid);
+    if (!s || !fields) return;
+    let changed = false;
+    if (typeof fields.sessionTitle === 'string' && fields.sessionTitle
+        && s.sessionTitle !== fields.sessionTitle) {
+      s.sessionTitle = fields.sessionTitle;
+      changed = true;
+    }
+    if (typeof fields.model === 'string' && fields.model && s.model !== fields.model) {
+      s.model = fields.model;
+      changed = true;
+    }
+    if (changed) onDirty();
+  }
+
   // Mark a session as "completion acknowledged" (user saw the done state).
   function ackCompletion(sid) {
     const s = sessions.get(sid);
@@ -273,16 +315,18 @@ function createCore(options = {}) {
     return {
       id: s.id,
       agentId: s.agentId || 'claude-code',
-      provider: s.provider || null,  // 'codewhale' | null(Claude)
       state: s.state || 'idle',
       badge: deriveBadge(s),
       cwd: s.cwd || '',
       headless: !!s.headless,
       sessionTitle: s.sessionTitle || null,
       model: s.model || null,
+      sessionRole: s.sessionRole || null,
+      travelAgent: s.travelAgent || null,
       contextUsage: s.contextUsage || null,
       assistantLastOutput: typeof s.assistantLastOutput === 'string' ? s.assistantLastOutput : null,
       assistantLastOutputTruncated: !!s.assistantLastOutputTruncated,
+      codexChoice: s.codexChoice || null,
       requiresCompletionAck: !!s.requiresCompletionAck,
       lastEvent: s.lastEvent || null,
       lastEventTool: s.lastEventTool || null,
@@ -294,8 +338,13 @@ function createCore(options = {}) {
       editor: s.editor || null,
       tmuxSocket: s.tmuxSocket || null,
       tmuxClient: s.tmuxClient || null,
+      terminalApp: s.terminalApp || null,
+      terminalTty: s.terminalTty || null,
       wtHwnd: s.wtHwnd || null,
       ghosttyTerminalId: s.ghosttyTerminalId || null,
+      backgroundTasksCount: Number(s.backgroundTasksCount) || 0,
+      sessionCronsCount: Number(s.sessionCronsCount) || 0,
+      stopHookActive: s.stopHookActive === true,
     };
   }
 
@@ -327,19 +376,16 @@ function createCore(options = {}) {
     let files = [];
     try {
       const cutoff = Date.now() - BACKFILL_MAX_AGE_MS;
-      let scanned = 0;
-      scanDirs: for (const d of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
+      for (const d of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
         if (!d.isDirectory()) continue;
         const sub = path.join(PROJECTS_DIR, d.name);
         let names; try { names = fs.readdirSync(sub); } catch { continue; }
         for (const n of names) {
-          if (++scanned > BACKFILL_SCAN_MAX) { log('core', `backfill scan capped at ${BACKFILL_SCAN_MAX} files`); break scanDirs; }
           if (!n.endsWith('.jsonl')) continue;
           const fp = path.join(sub, n);
-          let st; try { st = fs.lstatSync(fp); } catch { continue; }
-          if (!st.isFile() || st.isSymbolicLink()) continue;
+          let st; try { st = fs.statSync(fp); } catch { continue; }
           if (st.mtimeMs < cutoff) continue;
-          files.push({ fp, mtime: st.mtimeMs, size: st.size, id: n.slice(0, -6) });
+          files.push({ fp, mtime: st.mtimeMs, id: n.slice(0, -6) });
         }
       }
     } catch { return; }
@@ -358,7 +404,6 @@ function createCore(options = {}) {
         state: 'idle', recentEvents: [], agentId: 'claude-code',
         cwd, transcriptPath: f.fp, sessionTitle: transcript.sessionTitle(entries) || null,
         contextUsage: transcript.contextUsage(entries, f.id) || null,
-        transcriptScanKey: `${f.mtime}:${f.size}`,
         sourcePid: null, headless: false,
       });
       added++;
@@ -378,14 +423,13 @@ function createCore(options = {}) {
       const p = transcriptPathFor(s);
       if (!p) continue;
       try {
-        // transcript 的 mtime = 模型最近一次产出时间。只在 mtime/size
-        // 变化时重读 tail；大量空闲会话不再每 10 秒重复做磁盘 I/O/JSON 解析。
-        const st = fs.statSync(p);
-        if (!st.isFile()) continue;
-        s.transcriptActiveAt = st.mtimeMs;
-        const scanKey = `${st.mtimeMs}:${st.size}`;
-        if (s.transcriptScanKey === scanKey) continue;
-        s.transcriptScanKey = scanKey;
+        // transcript 的 mtime = 模型最近一次产出时间。事件间隙里文件还在长，
+        // 说明模型在干活（重连后继续跑/流式输出），adapter 据此不判摸鱼。
+        try { s.transcriptActiveAt = fs.statSync(p).mtimeMs; } catch {}
+        // 非 Claude 后端的 transcript 不是 Claude 格式（Codex 是 rollout JSONL，
+        // dsh 是 zstd 分帧的会话日志）：mtime 活跃度通用，但上下文/中断/API 错误
+        // 都由各自的 watcher 事件驱动，别用 Claude 解析器去猜（dsh 那份还是二进制）。
+        if (s.agentId && s.agentId !== 'claude-code') continue;
         const entries = transcript.readTail(p);
         if (!entries) continue;
         const cu = transcript.contextUsage(entries, s.id);
@@ -418,7 +462,7 @@ function createCore(options = {}) {
             changed = true;
           }
         }
-      } catch (e) { log('core', 'refreshContextUsage error for session', s.id ? s.id.slice(0, 8) : '?', ':', e.message); } // #r10
+      } catch {}
     }
     return changed;
   }
@@ -428,7 +472,12 @@ function createCore(options = {}) {
     const now = Date.now();
     for (const [id, s] of sessions) {
       const idle = now - (s.updatedAt || now);
+      const sourceIdle = now - Math.max(s.updatedAt || 0, s.transcriptActiveAt || 0);
       const alive = s.sourcePid ? pidAlive(s.sourcePid) : null;
+      // Claude and Codex each own one durable LLMPET travel conversation.
+      // Its terminal is intentionally closed between outings, but the mailbox
+      // remains a first-class pet card and is resumed on the next departure.
+      const durableTravelSession = s.sessionRole === 'travel';
 
       // Oneshot decay backstop: error/attention/sweeping/carrying settle to idle
       // after their TTL if no further event arrives (StopFailure / /clear paths).
@@ -437,21 +486,24 @@ function createCore(options = {}) {
 
       // Ended session (SessionEnd → sleeping / clear → sweeping): retire after a while.
       if (s.state === 'sleeping' || s.ended) {
-        if (idle > SESSION_STALE_MS) { sessions.delete(id); changed = true; }
+        if (!durableTravelSession && idle > SESSION_STALE_MS) { sessions.delete(id); changed = true; }
         if (s.state === 'sleeping') continue;
       }
       // Terminal process is gone → remove after a short grace.
-      if (alive === false && idle > DETACHED_REMOVE_MS) {
+      if (!durableTravelSession && alive === false && idle > DETACHED_REMOVE_MS) {
         sessions.delete(id); changed = true; continue;
       }
-      // No terminal info at all + silent very long → remove.
-      if (alive === null && idle > SESSION_STALE_MS) {
+      // No terminal info at all + source transcript silent very long → remove.
+      // Codex Desktop has no terminal pid. A long task can keep appending rollout
+      // rows that do not map to state transitions (token counts, world state,
+      // sub-agent activity), so event-idle alone must not evict a live session.
+      if (!durableTravelSession && alive === null && sourceIdle > SESSION_STALE_MS) {
         sessions.delete(id); changed = true; continue;
       }
       // Stuck working/thinking → settle to idle, but KEEP it visible.
       // 「卡死」的判定用 事件时间 和 transcript 产出时间 取较新者：慢长任务
       // （17 分钟一轮、token 缓慢增长）事件少但文件一直在写，不算卡死。
-      const busyIdle = now - Math.max(s.updatedAt || 0, s.transcriptActiveAt || 0);
+      const busyIdle = sourceIdle;
       if (BUSY_STATES.has(s.state) && busyIdle > WORKING_STALE_MS) {
         s.state = 'idle'; changed = true;
       }
@@ -463,47 +515,22 @@ function createCore(options = {}) {
 
   function startStaleCleanup() {
     if (cleanupTimer) return;
-    // Start the periodic cleanup interval immediately so 10s sweeps begin
-    // right away — this is just a setInterval registration, no I/O.
+    try { backfillFromTranscripts(); } catch (e) { log('core', 'backfill failed:', e.message); }
     cleanupTimer = setInterval(cleanStaleSessions, 10000);
     if (cleanupTimer.unref) cleanupTimer.unref();
-    // #r7-fix: defer the initial backfill to the next event-loop tick so
-    // Electron boot (BrowserWindow creation, IPC handler registration,
-    // first paint) is not blocked by a synchronous filesystem scan of
-    // ~/.claude/projects (up to BACKFILL_SCAN_MAX=5000 files + reading
-    // tails of up to BACKFILL_MAX=15 transcripts). The periodic 10s
-    // sweep above already calls refreshContextUsage() which does the
-    // ongoing tail re-reads, so the only thing deferred is the one-shot
-    // boot seeding. References:
-    //   - https://electronjs.org/docs/latest/tutorial/performance
-    //     "If you have expensive setup operations, consider deferring those."
-    //   - https://nodejs.org/learn/asynchronous-work/event-loop-timers-and-nexttick
-    //     setImmediate schedules the callback after I/O events in the
-    //     current loop, so pending I/O (window load) runs first.
-    // If a /state request arrives before backfill completes, buildSnapshot()
-    // simply returns an empty (or partial) session list — same as on a
-    // fresh install with no transcripts. No data loss; hooks will still
-    // populate sessions as they fire.
-    pendingBackfill = true;
-    setImmediate(() => {
-      if (!pendingBackfill) return; // cancelled by stopStaleCleanup
-      pendingBackfill = false;
-      try { backfillFromTranscripts(); } catch (e) { log('core', 'backfill failed:', e.message); }
-    });
   }
 
   function stopStaleCleanup() {
     if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null; }
-    // #r7-fix: cancel any pending deferred backfill so a rapid
-    // start→stop cycle (e.g. test teardown, app quit during boot)
-    // doesn't leak a filesystem-scan callback running after shutdown.
-    pendingBackfill = false;
   }
 
   return {
     sessions,
     VALID_STATES,
     updateSession,
+    seedSession,
+    setContextUsage,
+    setSessionMeta,
     ackCompletion,
     getSession,
     buildSnapshot,
@@ -520,6 +547,4 @@ module.exports = {
   VALID_STATES,
   getPriority,
   deriveBadge,
-  MAX_SESSIONS,
-  BACKFILL_SCAN_MAX,
 };

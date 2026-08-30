@@ -7,7 +7,9 @@
 
 const http = require('http');
 const assert = require('assert');
+const fs = require('fs');
 const os = require('os');
+const path = require('path');
 const { createCore } = require('../backend/core');
 const { createPermissions } = require('../backend/permission');
 const { createServer } = require('../backend/server');
@@ -21,17 +23,24 @@ const core = createCore({
   onDirty: () => { dirtyCount++; },
 });
 const permissions = createPermissions({
+  shouldDrop: () => false,
   onAdded: (entry) => { events.push({ kind: 'waiting', permId: entry.id, sessionId: entry.sessionId }); },
   onChange: () => {},
 });
-const server = createServer({ core, permissions, shouldDropForDnd: () => false, transcriptRoots: [os.tmpdir()] });
+const server = createServer({ core, permissions, shouldDropForDnd: () => false });
 
-function post(pathName, body) {
-  return new Promise((resolve, reject) => {
+function postAbortable(pathName, body, options = {}) {
+  let req;
+  const settled = new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
-    const req = http.request(
-      { hostname: '127.0.0.1', port: server.getPort(), path: pathName, method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'x-octopus-token': server.getToken() } },
+    const authenticated = options.auth !== false;
+    const requestPath = authenticated && pathName === '/permission'
+      ? `${pathName}?token=${encodeURIComponent(server.getToken())}`
+      : pathName;
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
+    if (authenticated && pathName === '/state') headers['x-octopus-token'] = server.getToken();
+    req = http.request(
+      { hostname: '127.0.0.1', port: server.getPort(), path: requestPath, method: 'POST', headers },
       (res) => {
         let data = '';
         res.on('data', (c) => (data += c));
@@ -41,6 +50,11 @@ function post(pathName, body) {
     req.on('error', reject);
     req.end(payload);
   });
+  return { req, settled };
+}
+
+function post(pathName, body, options) {
+  return postAbortable(pathName, body, options).settled;
 }
 
 function get(pathName) {
@@ -63,6 +77,12 @@ function check(name, fn) {
 }
 
 async function main() {
+  console.log('[0] provider identity：未知来源绝不伪装成 Claude');
+  check('缺省 hook 仍兼容 Claude', () => assert.strictEqual(adapter.agentOf({}), 'claude'));
+  check('DeepSeek Harness 映射为 dsh', () => assert.strictEqual(adapter.agentOf({ agentId: 'dsh' }), 'dsh'));
+  check('未知 provider 保持 unknown', () => assert.strictEqual(adapter.agentOf({ agentId: 'future-agent' }), 'unknown'));
+  check('未知 provider 使用中性名称', () => assert.strictEqual(adapter.agentLabel({ agentId: 'future-agent' }), 'Agent'));
+
   server.start();
   for (let i = 0; i < 50 && !server.getPort(); i++) await sleep(20);
   assert(server.getPort(), 'server failed to bind a port');
@@ -76,16 +96,39 @@ async function main() {
     assert.strictEqual(health.headers['x-octopus-server'], 'octopus');
   });
 
+  console.log('\n[1b] write endpoints require the per-run token');
+  let r = await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'forged' }, { auth: false });
+  check('unauthenticated state write → 403', () => {
+    assert.strictEqual(r.status, 403);
+    assert.strictEqual(core.getSession('forged'), null);
+  });
+  r = await post('/permission', { tool_name: 'Bash', tool_input: {}, session_id: 'forged' }, { auth: false });
+  check('unauthenticated permission write → 403', () => {
+    assert.strictEqual(r.status, 403);
+    assert.strictEqual(permissions.getPending().length, 0);
+  });
+
   console.log('\n[2] session lifecycle via /state');
-  let r = await post('/state', { state: 'idle', event: 'SessionStart', session_id: SID, cwd: '/Users/me/proj-x' });
+  r = await post('/state', { state: 'idle', event: 'SessionStart', session_id: SID, cwd: '/Users/me/proj-x' });
   check('SessionStart accepted', () => { assert.strictEqual(r.status, 200); assert.strictEqual(r.headers['x-octopus-server'], 'octopus'); });
+  check('SessionStart 立即发出 greet（不必等首条 prompt）', () =>
+    assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-x')));
 
   r = await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: SID, cwd: '/Users/me/proj-x' });
-  check('greet emitted on first prompt（欢迎延迟到首条输入）', () => assert(events.some((e) => e.kind === 'greet')));
+  check('首条 prompt 正常发出 user-turn', () =>
+    assert(events.some((e) => e.kind === 'user-turn' && e.project === 'proj-x')));
   check('session is thinking', () => assert.strictEqual(core.getSession(SID).state, 'thinking'));
 
   r = await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: SID, cwd: '/Users/me/proj-x' });
-  check('user-turn event emitted（第二条起）', () => assert(events.some((e) => e.kind === 'user-turn')));
+  check('user-turn event emitted（后续 prompt）', () => assert(events.some((e) => e.kind === 'user-turn')));
+
+  const taskSid = 'task-start-session-aaaa';
+  await post('/state', { state: 'idle', event: 'SessionStart', session_id: taskSid, cwd: '/Users/me/proj-task-start' });
+  await post('/state', { state: 'thinking', event: 'TaskStarted', session_id: taskSid, cwd: '/Users/me/proj-task-start' });
+  const taskTurns = () => events.filter((e) => e.kind === 'user-turn' && e.project === 'proj-task-start');
+  check('TaskStarted 单独也能触发新任务表情', () => assert.strictEqual(taskTurns().length, 1));
+  await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: taskSid, cwd: '/Users/me/proj-task-start' });
+  check('紧随的中性 UserPromptSubmit 不重复抢动画', () => assert.strictEqual(taskTurns().length, 1));
 
   r = await post('/state', { state: 'working', event: 'PreToolUse', tool_name: 'Bash', session_id: SID, cwd: '/Users/me/proj-x' });
   check('operation event for Bash', () => assert(events.some((e) => e.kind === 'operation' && e.tool === 'Bash')));
@@ -96,6 +139,7 @@ async function main() {
   });
   check('turn-done event emitted', () => assert(events.some((e) => e.kind === 'turn-done')));
   check('say event carries Claude message', () => assert(events.some((e) => e.kind === 'say' && /修好/.test(e.text))));
+  check('ending event carries stable session ID', () => assert(events.some((e) => e.kind === 'say' && e.sessionId === SID)));
   check('session requiresCompletionAck after Stop', () => assert.strictEqual(core.getSession(SID).requiresCompletionAck, true));
 
   console.log('\n[3] unknown state rejected');
@@ -148,18 +192,154 @@ async function main() {
   const ptResp = await post('/permission', { tool_name: 'TaskCreate', tool_input: {}, session_id: 'pt' });
   check('TaskCreate auto-allow', () => assert.strictEqual(JSON.parse(ptResp.body).hookSpecificOutput.decision.behavior, 'allow'));
 
-  console.log('\n[7] stale permission swept when user answers in terminal');
+  console.log('\n[6b] dedicated travel session keeps a stable letter in the pet');
+  const travelSid = 'travel-dedicated-session';
+  await post('/state', {
+    state: 'working',
+    event: 'PreToolUse',
+    tool_name: 'WebFetch',
+    session_id: travelSid,
+    cwd: '/Users/me/.octopus/wander-home/sessions/claude',
+  });
+  core.getSession(travelSid).sessionRole = 'travel';
+  core.getSession(travelSid).travelAgent = 'claude';
+  const travelPermission = post('/permission', {
+    tool_name: 'WebFetch',
+    tool_input: { url: 'https://example.com' },
+    session_id: travelSid,
+  });
+  await sleep(30);
+  const travelPending = permissions.getPending().find((entry) => entry.sessionId === travelSid);
+  check('travel permission remains pending until the user answers', () => {
+    assert(travelPending);
+  });
+  const travelStats = adapter.buildPetStats(core.buildSnapshot(), permissions.getPending(), null);
+  check('travel permission is a first-class letter with reusable web approval', () => {
+    const session = travelStats.sessions.find((item) => item.sessionId === travelSid);
+    assert(session && session.choice && session.choice.travel === true);
+    assert.strictEqual(session.project, 'Claude 旅行信箱');
+    assert(session.choice.options.some((option) => option.key === 'travel:always-web'));
+  });
+  permissions.decide(travelPending.id, 'allow');
+  await travelPermission;
+
+  console.log('\n[7] 并行事件保留权限卡；只在 SessionEnd 无裁决清理');
   const sweepSid = 'sweep-session-dddd';
-  const sweepP = post('/permission', { tool_name: 'Bash', tool_input: { command: 'rm -rf build' }, session_id: sweepSid });
+  const bashP = post('/permission', { tool_name: 'Bash', tool_input: { command: 'ls' }, session_id: sweepSid });
+  const writeP = post('/permission', { tool_name: 'Write', tool_input: { file_path: '/tmp/parallel.txt' }, session_id: sweepSid });
   await sleep(60);
-  check('one pending before sweep', () => assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === sweepSid).length, 1));
-  await post('/state', { state: 'working', event: 'PostToolUse', tool_name: 'Bash', session_id: sweepSid });
-  const sweepResp = await sweepP;
-  check('swept perm got deny', () => assert.strictEqual(JSON.parse(sweepResp.body).hookSpecificOutput.decision.behavior, 'deny'));
+  check('two distinct permissions can wait in one shared session', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === sweepSid).length, 2);
+  });
+  for (const [event, state] of [
+    ['PostToolUse', 'working'],
+    ['PostToolUseFailure', 'error'],
+    ['Stop', 'attention'],
+    ['UserPromptSubmit', 'thinking'],
+  ]) {
+    await post('/state', { state, event, tool_name: 'Bash', session_id: sweepSid });
+  }
+  check('unrelated lifecycle events keep both live permission cards', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === sweepSid).length, 2);
+  });
+  const sweepPending = permissions.getPending().filter((p) => p.sessionId === sweepSid);
+  permissions.decide(sweepPending.find((p) => p.toolName === 'Bash').id, 'allow');
+  permissions.decide(sweepPending.find((p) => p.toolName === 'Write').id, 'deny');
+  const [bashResp, writeResp] = await Promise.all([bashP, writeP]);
+  check('later clicks resolve only their matching parallel requests', () => {
+    assert.strictEqual(JSON.parse(bashResp.body).hookSpecificOutput.decision.behavior, 'allow');
+    assert.strictEqual(JSON.parse(writeResp.body).hookSpecificOutput.decision.behavior, 'deny');
+  });
+
+  const endSid = 'ended-session-eeee';
+  const endSettled = post('/permission', { tool_name: 'Bash', tool_input: { command: 'pwd' }, session_id: endSid })
+    .then((resp) => ({ resp }), (err) => ({ err }));
+  await sleep(60);
+  await post('/state', { state: 'sleeping', event: 'SessionEnd', session_id: endSid });
+  const endOutcome = await endSettled;
+  check('SessionEnd drops stale permission without allow/deny', () => {
+    assert(endOutcome.err);
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === endSid).length, 0);
+  });
+
+  console.log('\n[7b] primary hook disconnect promotes a live duplicate instead of denying it');
+  const dupSid = 'duplicate-session-ffff';
+  const dupBody = { tool_name: 'Bash', tool_input: { command: 'echo duplicate' }, session_id: dupSid };
+  const primary = postAbortable('/permission', dupBody);
+  primary.settled.catch(() => {});
+  await sleep(30);
+  const duplicate = postAbortable('/permission', dupBody);
+  await sleep(60);
+  check('identical retry shares one permission card', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === dupSid).length, 1);
+  });
+  primary.req.destroy();
+  await sleep(30);
+  check('card remains pending after primary connection closes', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === dupSid).length, 1);
+  });
+  const dupPending = permissions.getPending().find((p) => p.sessionId === dupSid);
+  permissions.decide(dupPending.id, 'allow');
+  const duplicateResp = await duplicate.settled;
+  check('promoted duplicate receives the later user decision', () => {
+    assert.strictEqual(JSON.parse(duplicateResp.body).hookSpecificOutput.decision.behavior, 'allow');
+  });
+
+  const soloSid = 'disconnected-session-gggg';
+  const solo = postAbortable('/permission', {
+    tool_name: 'Bash',
+    tool_input: { command: 'echo terminal-answer' },
+    session_id: soloSid,
+  });
+  solo.settled.catch(() => {});
+  await sleep(60);
+  solo.req.destroy();
+  await sleep(30);
+  check('last connection close cleans the card without a synthetic decision', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === soloSid).length, 0);
+  });
+
+  console.log('\n[7c] CLI/Desktop 已回答选择 → 精确关闭对应桌宠弹窗');
+  const extDir = fs.mkdtempSync(path.join(os.tmpdir(), 'octo-external-answer-'));
+  const extFile = path.join(extDir, 'external-answer.jsonl');
+  const externalAnswerSid = 'external-answer-session';
+  const extInput = { questions: [{ question: '选哪个方案？', options: [{ label: 'A' }, { label: 'B' }] }] };
+  const otherInput = { questions: [{ question: '另一个并行问题？', options: [{ label: '甲' }, { label: '乙' }] }] };
+  const askTs = Date.now();
+  fs.writeFileSync(extFile,
+    JSON.stringify({ type: 'assistant', sessionId: externalAnswerSid, timestamp: new Date(askTs).toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_external_answer', name: 'AskUserQuestion', input: extInput }] } }) + '\n' +
+    JSON.stringify({ type: 'assistant', sessionId: externalAnswerSid, timestamp: new Date(askTs + 1).toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_other_live', name: 'AskUserQuestion', input: otherInput }] } }) + '\n');
+  const extOutcomeP = post('/permission', {
+    tool_name: 'AskUserQuestion', tool_input: extInput, session_id: externalAnswerSid, transcript_path: extFile,
+  }).then((resp) => ({ resp }), (err) => ({ err }));
+  const otherOutcomeP = post('/permission', {
+    tool_name: 'AskUserQuestion', tool_input: otherInput, session_id: externalAnswerSid, transcript_path: extFile,
+  });
+  await sleep(80);
+  check('同 session 的两个不同选择都先保持 pending', () => {
+    assert.strictEqual(permissions.getPending().filter((p) => p.sessionId === externalAnswerSid).length, 2);
+  });
+  fs.appendFileSync(extFile,
+    JSON.stringify({ type: 'user', sessionId: externalAnswerSid, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_external_answer', content: 'Your questions have been answered: "选哪个方案？"="A".' }] } }) + '\n');
+  for (let i = 0; i < 20 && permissions.getPending().filter((p) => p.sessionId === externalAnswerSid).length !== 1; i++) await sleep(100);
+  const extPending = permissions.getPending().filter((p) => p.sessionId === externalAnswerSid);
+  check('外部已回答的卡片自动消失，另一个并行选择仍保留', () => {
+    assert.strictEqual(extPending.length, 1);
+    assert.strictEqual(extPending[0].toolInput.questions[0].question, '另一个并行问题？');
+  });
+  const extOutcome = await extOutcomeP;
+  check('自动关闭只撤销自己的 HTTP hook，不伪造第二次答案', () => assert(extOutcome.err));
+  permissions.decide(extPending[0].id, {
+    type: 'elicitation-submit', answers: { '另一个并行问题？': '甲' },
+  });
+  await otherOutcomeP;
+  fs.rmSync(extDir, { recursive: true, force: true });
 
   console.log('\n[8] juggling/sweeping 透传（皮肤素材可达）+ 计数');
   const jSid = 'juggle-session-eeee';
   await post('/state', { state: 'juggling', event: 'SubagentStart', session_id: jSid, cwd: '/Users/me/proj-j' });
+  await post('/state', { state: 'working', event: 'Reasoning', session_id: jSid, cwd: '/Users/me/proj-j' });
+  await post('/state', { state: 'working', event: 'PreToolUse', tool_name: 'Read', session_id: jSid, cwd: '/Users/me/proj-j' });
   const sSid = 'sweep-session-ffff';
   await post('/state', { state: 'sweeping', event: 'PreCompact', session_id: sSid, cwd: '/Users/me/proj-s' });
   {
@@ -167,6 +347,9 @@ async function main() {
     const js = st.sessions.find((x) => x.sessionId === jSid);
     const ss = st.sessions.find((x) => x.sessionId === sSid);
     check('juggling 不再折叠成 working', () => assert.strictEqual(js.state, 'juggling'));
+    check('子 agent 期间 Reasoning/工具事件不压回 working', () => assert.strictEqual(core.getSession(jSid).state, 'juggling'));
+    check('子 agent 工具事件携带 juggling 渲染态', () => assert(events.some((e) =>
+      e.kind === 'operation' && e.project === 'proj-j' && e.visualState === 'juggling')));
     check('sweeping 不再折叠成 working', () => assert.strictEqual(ss.state, 'sweeping'));
     check('jugglingCount/sweepingCount 计数', () => {
       assert(st.jugglingCount >= 1 && st.sweepingCount >= 1);
@@ -212,6 +395,41 @@ async function main() {
     const b = hook.buildBody('UserPromptSubmit', { session_id: 'x1', prompt: 'hi' });
     assert(b && b.state === 'thinking' && b.session_id === 'x1');
   });
+  check('Claude Code 新旧子 agent 工具名都进 juggling', () => {
+    const task = hook.buildBody('PreToolUse', { session_id: 'x-task', tool_name: 'Task' });
+    const agent = hook.buildBody('PreToolUse', { session_id: 'x-agent', tool_name: 'Agent' });
+    assert(task && task.state === 'juggling');
+    assert(agent && agent.state === 'juggling');
+  });
+  const claudeFallbackSid = 'claude-agent-fallback';
+  await post('/state', {
+    state: 'juggling', event: 'PreToolUse', tool_name: 'Agent',
+    session_id: claudeFallbackSid, cwd: '/Users/me/proj-claude-agent',
+  });
+  check('Claude fallback 子 agent 调用期间为 juggling', () =>
+    assert.strictEqual(core.getSession(claudeFallbackSid).state, 'juggling'));
+  await post('/state', {
+    state: 'working', event: 'PostToolUse', tool_name: 'Agent',
+    session_id: claudeFallbackSid, cwd: '/Users/me/proj-claude-agent',
+  });
+  check('Claude fallback 子 agent 结果到达后释放回 working', () =>
+    assert.strictEqual(core.getSession(claudeFallbackSid).state, 'working'));
+  check('表情包原生续聊不伪装成 headless，也不覆盖原窗口路由', () => {
+    const prev = process.env.LLMPET_MEME_RESUME;
+    process.env.LLMPET_MEME_RESUME = '1';
+    try {
+      const b = hook.buildBody('UserPromptSubmit', { session_id: 'x1-resume', prompt: 'hi' });
+      assert(b && b.headless === false && b.external_resume === true);
+      assert.strictEqual(b.source_pid, undefined);
+    } finally {
+      if (prev === undefined) delete process.env.LLMPET_MEME_RESUME;
+      else process.env.LLMPET_MEME_RESUME = prev;
+    }
+  });
+  const extSid = 'external-resume-session';
+  await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: extSid, cwd: '/Users/me/proj-ext', external_resume: true });
+  await post('/state', { state: 'sweeping', event: 'SessionEnd', session_id: extSid, cwd: '/Users/me/proj-ext', external_resume: true });
+  check('原生续聊进程退出不把原 session 标记为 ended', () => assert.strictEqual(core.getSession(extSid).ended, false));
   const opSid = 'op-label-jjjj';
   await post('/state', { state: 'working', event: 'PreToolUse', tool_name: 'Bash', session_id: opSid, cwd: '/Users/me/proj-op' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: opSid, cwd: '/Users/me/proj-op' });
@@ -221,23 +439,55 @@ async function main() {
     check('thinking 阶段不显示上一轮的「运行命令」', () => assert.strictEqual(eOp.op, null));
   }
 
-  console.log('\n[13] greet 延迟到第一条 prompt：入口会话静默、真对话欢迎');
-  // 用户定义情形 b：看板上没有的会话被 resume 进入 = 新对话，说话后欢迎
+  console.log('\n[13] SessionStart 即时欢迎：新建与 resume 都不等 prompt');
+  // 用户定义情形 b：看板上没有的会话被 resume 进入 = 新激活会话
   const rsSid = 'resume-session-kkkk';
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: rsSid, cwd: '/Users/me/proj-resume', session_source: 'resume' });
-  await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: rsSid, cwd: '/Users/me/proj-resume' });
-  check('看板外会话 resume 进入 + 说话 → 欢迎', () => assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-resume')));
+  check('看板外会话 resume 进入 → 立即欢迎', () => assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-resume')));
   const nsSid = 'startup-session-llll';
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: nsSid, cwd: '/Users/me/proj-fresh', session_source: 'startup' });
-  check('SessionStart 本身不欢迎（等第一条 prompt）', () => assert(!events.some((e) => e.kind === 'greet' && e.project === 'proj-fresh')));
+  check('新对话 SessionStart 本身就欢迎', () => assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-fresh')));
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: nsSid, cwd: '/Users/me/proj-fresh' });
-  check('新对话第一条 prompt → 欢迎', () => assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-fresh')));
-  check('欢迎时不叠 user-turn（短暂态不互抢）', () =>
-    assert(!events.some((e) => e.kind === 'user-turn' && e.project === 'proj-fresh')));
+  check('首条 prompt 仍有 user-turn，renderer 负责保住 greet 短暂态', () =>
+    assert(events.some((e) => e.kind === 'user-turn' && e.project === 'proj-fresh')));
   check('hook 转发 SessionStart source', () => {
     const b = hook.buildBody('SessionStart', { session_id: 'x2', source: 'resume' });
     assert(b && b.session_source === 'resume');
   });
+  check('Claude Hook 同一事件只保留一个 LLMPET 入口', () => {
+    const { syncEvent } = require('../backend/hookinstall');
+    const own = (h) => !!(h && typeof h.command === 'string' && h.command.includes('octopus-hook.js'));
+    const hooks = {
+      UserPromptSubmit: [
+        { matcher: '', hooks: [
+          { type: 'command', command: '/old/node /old/octopus-hook.js UserPromptSubmit', timeout: 1 },
+          { type: 'command', command: '/other/app-hook.js', timeout: 3 },
+        ] },
+        { matcher: 'duplicate', hooks: [
+          { type: 'command', command: '/another/octopus-hook.js UserPromptSubmit', timeout: 2 },
+        ] },
+        { matcher: 'empty-user-group', hooks: [] },
+      ],
+    };
+    const desired = { type: 'command', command: '/node /app/octopus-hook.js UserPromptSubmit', timeout: 5 };
+    assert.strictEqual(syncEvent(hooks, 'UserPromptSubmit', desired, own), 'updated');
+    const all = hooks.UserPromptSubmit.flatMap((group) => group.hooks || []);
+    assert.strictEqual(all.filter(own).length, 1);
+    assert.strictEqual(all.filter(own)[0].command, desired.command);
+    assert(all.some((h) => h.command === '/other/app-hook.js'));
+    assert(hooks.UserPromptSubmit.some((group) => group.matcher === 'empty-user-group'));
+  });
+  check('Claude ElicitationResult 释放已回答的 needsinput', () => {
+    const b = hook.buildBody('ElicitationResult', { session_id: 'elicitation-result-test' });
+    assert(b && b.state === 'working' && b.event === 'ElicitationResult');
+    const { COMMAND_EVENTS } = require('../backend/hookinstall');
+    assert(COMMAND_EVENTS.includes('ElicitationResult'));
+  });
+  const elicitationSid = 'elicitation-result-test';
+  await post('/state', { state: 'notification', event: 'Elicitation', session_id: elicitationSid, cwd: '/Users/me/proj-elicit' });
+  await post('/state', { state: 'working', event: 'ElicitationResult', session_id: elicitationSid, cwd: '/Users/me/proj-elicit' });
+  check('Elicitation 回答后稳态不再卡在 notification', () =>
+    assert.strictEqual(core.getSession(elicitationSid).state, 'working'));
 
   console.log('\n[14] 工具结束后长间隙 = 摸鱼（loafing），不硬说思考');
   const tgSid = 'loafgap-session-mmmm';
@@ -271,6 +521,16 @@ async function main() {
     const eTg = st.sessions.find((x) => x.sessionId === tgSid);
     check('间隙且 transcript 长时间不动 → loafing 摸鱼', () => assert.strictEqual(eTg.state, 'loafing'));
   }
+  const codexGapSid = 'codex-gap-session-rrrr';
+  await post('/state', { state: 'working', event: 'PostToolUse', tool_name: 'Bash', session_id: codexGapSid, cwd: '/Users/me/proj-codex' });
+  core.sessions.get(codexGapSid).agentId = 'codex'; // Codex watcher 直连 core；HTTP hook 固定是 Claude
+  core.sessions.get(codexGapSid).updatedAt = Date.now() - 6000;
+  core.sessions.get(codexGapSid).transcriptActiveAt = Date.now() - 6000;
+  {
+    const st = adapter.buildPetStats(core.buildSnapshot(), [], null);
+    const eCodex = st.sessions.find((x) => x.sessionId === codexGapSid);
+    check('Codex PostToolUse 长间隙仍是 working（等明确 task_complete）', () => assert.strictEqual(eCodex.state, 'working'));
+  }
   // 慢长任务（17m 一轮、token 缓涨）：事件 6 分钟没来但文件半分钟前还在写 → 不被卡死兜底打成 idle
   core.sessions.get(tgSid).updatedAt = Date.now() - 6 * 60 * 1000;
   core.sessions.get(tgSid).transcriptActiveAt = Date.now() - 30 * 1000;
@@ -278,8 +538,6 @@ async function main() {
   check('慢长任务不被 WORKING_STALE 打成 idle', () => assert.strictEqual(core.getSession(tgSid).state, 'working'));
 
   console.log('\n[15] SessionStart 无 source 时用 transcript 历史兜底');
-  const fs = require('fs');
-  const path = require('path');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'octo-test-'));
   const histFile = path.join(tmpDir, 'hist.jsonl');
   fs.writeFileSync(histFile, JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '之前聊过' }] } }) + '\n'
@@ -297,31 +555,37 @@ async function main() {
     assert.strictEqual(b.session_source, 'compact');
   });
 
-  console.log('\n[17] 同 cwd 已有活跃会话 → 说话也不欢迎（进入执行中任务兜底）');
+  console.log('\n[17] 同 cwd 并行新会话仍要欢迎');
   const busyCwd = '/Users/me/proj-busy-x';
   await post('/state', { state: 'working', event: 'PreToolUse', tool_name: 'Bash', session_id: 'busy-owner-oooo', cwd: busyCwd });
   // ccd 点进该任务：fork 新 id + 无 source + 空 transcript（最恶劣组合）
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'fork-entry-pppp', cwd: busyCwd, session_source: 'startup' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'fork-entry-pppp', cwd: busyCwd });
-  check('同 cwd 忙碌中，进入后说话也不欢迎', () =>
-    assert(!events.some((e) => e.kind === 'greet' && e.project === 'proj-busy-x')));
+  check('同 cwd 忙碌中，新 session 仍有独立欢迎', () =>
+    assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-busy-x')));
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'fresh-proj-qqqq', cwd: '/Users/me/proj-brand-new', session_source: 'startup' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'fresh-proj-qqqq', cwd: '/Users/me/proj-brand-new' });
   check('全新项目的新对话仍正常欢迎', () =>
     assert(events.some((e) => e.kind === 'greet' && e.project === 'proj-brand-new')));
 
-  console.log('\n[19] 工具拉起的一次性目录会话 + 同项目欢迎频控');
+  console.log('\n[19] 工具拉起的一次性目录会话 + 同项目独立 session');
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'toolspawn-ssss', cwd: '/Users/me/.someapp/sessions/ab12cd34', session_source: 'startup' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'toolspawn-ssss', cwd: '/Users/me/.someapp/sessions/ab12cd34' });
   check('隐藏目录 cwd（工具拉起）说话也不欢迎', () =>
     assert(!events.some((e) => e.kind === 'greet' && e.project === 'ab12cd34')));
-  // 同项目名 30 分钟频控：第一次欢迎后，另一个同名项目的新对话不再欢迎
+  await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'hidden-project-ssss', cwd: '/Users/me/.dotfiles', session_source: 'startup' });
+  check('合法隐藏项目不会被一次性 sessions 规则误伤', () =>
+    assert(events.some((e) => e.kind === 'greet' && e.project === '.dotfiles')));
+  await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'codex-worktree-ssss', cwd: '/Users/me/.codex/worktrees/feature-x', session_source: 'startup' });
+  check('Codex 隐藏根目录下的真实 worktree 仍欢迎', () =>
+    assert(events.some((e) => e.kind === 'greet' && e.project === 'feature-x')));
+  // 项目名不是会话身份：两个新 session 都要欢迎。
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'debounce-a-tttt', cwd: '/Users/me/proj-debounce', session_source: 'startup' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'debounce-a-tttt', cwd: '/Users/me/proj-debounce' });
   await post('/state', { state: 'idle', event: 'SessionStart', session_id: 'debounce-c-vvvv', cwd: '/tmp/other/proj-debounce', session_source: 'startup' });
   await post('/state', { state: 'thinking', event: 'UserPromptSubmit', session_id: 'debounce-c-vvvv', cwd: '/tmp/other/proj-debounce' });
-  check('同项目 30 分钟内只欢迎一次', () =>
-    assert.strictEqual(events.filter((e) => e.kind === 'greet' && e.project === 'proj-debounce').length, 1));
+  check('同项目的两个新 session 都欢迎', () =>
+    assert.strictEqual(events.filter((e) => e.kind === 'greet' && e.project === 'proj-debounce').length, 2));
 
   console.log('\n[16] ESC 中断检测（transcript 发现，10s 巡检放下忙碌态）');
   const intSid = 'interrupt-session-nnnn';

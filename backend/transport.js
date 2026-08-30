@@ -1,6 +1,6 @@
 'use strict';
 
-// Octopus transport — original implementation.
+// LLMPET transport — original implementation.
 //
 // Shared between the hook script and the server: a small set of localhost ports,
 // a runtime file that records which port the running app bound, the identity
@@ -10,13 +10,12 @@
 //
 // The protocol facts this targets (Claude Code's hook command/HTTP shape, the
 // PermissionRequest response JSON) are interfaces, not anyone's code — this file
-// is written from scratch with Octopus's own naming/ports/paths.
+// is written from scratch with LLMPET's own protocol/ports/paths.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
-const crypto = require('crypto');
 
 const SERVER_ID = 'octopus';
 const SERVER_HEADER = 'x-octopus-server';
@@ -34,29 +33,29 @@ function inRange(port) {
   return Number.isInteger(p) && PORTS.includes(p) ? p : null;
 }
 
-function validToken(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{32,128}$/.test(value) ? value : null;
-}
-
-function createRuntimeToken() {
-  return crypto.randomBytes(32).toString('base64url');
+function validToken(token) {
+  return typeof token === 'string' && /^[a-f0-9]{48,128}$/i.test(token) ? token : null;
 }
 
 function readRuntimeConfig() {
   try {
     const obj = JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'));
-    const port = obj && obj.app === SERVER_ID ? inRange(obj.port) : null;
-    const token = obj && validToken(obj.token);
-    if (!port || !token) return null;
-    return { app: SERVER_ID, port, token, pid: Number.isInteger(obj.pid) ? obj.pid : null };
+    const port = inRange(obj && obj.port);
+    const token = validToken(obj && obj.token);
+    return obj && obj.app === SERVER_ID && port && token ? { app: SERVER_ID, port, token } : null;
   } catch {
     return null;
   }
 }
 
 function readRuntimePort() {
-  const cfg = readRuntimeConfig();
-  return cfg ? cfg.port : null;
+  const runtime = readRuntimeConfig();
+  return runtime ? runtime.port : null;
+}
+
+function readRuntimeToken() {
+  const runtime = readRuntimeConfig();
+  return runtime ? runtime.token : null;
 }
 
 function writeRuntimeConfig(port, token) {
@@ -64,12 +63,9 @@ function writeRuntimeConfig(port, token) {
   const t = validToken(token);
   if (!p || !t) return false;
   try {
-    const dir = path.dirname(RUNTIME_PATH);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    try { fs.chmodSync(dir, 0o700); } catch {}
-    const tmp = path.join(dir, `.runtime.${process.pid}.${Date.now()}.tmp`);
-    fs.writeFileSync(tmp, JSON.stringify({ app: SERVER_ID, port: p, token: t, pid: process.pid }), { encoding: 'utf8', mode: 0o600 });
-    try { fs.chmodSync(tmp, 0o600); } catch {}
+    fs.mkdirSync(path.dirname(RUNTIME_PATH), { recursive: true });
+    const tmp = path.join(path.dirname(RUNTIME_PATH), `.runtime.${process.pid}.${Date.now()}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify({ app: SERVER_ID, port: p, token: t }), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, RUNTIME_PATH);
     try { fs.chmodSync(RUNTIME_PATH, 0o600); } catch {}
     return true;
@@ -78,37 +74,25 @@ function writeRuntimeConfig(port, token) {
   }
 }
 
-function clearRuntimeConfig(expected) {
-  try {
-    if (expected) {
-      const cur = readRuntimeConfig();
-      if (!cur || cur.port !== expected.port || cur.token !== expected.token) return false;
-    }
-    fs.unlinkSync(RUNTIME_PATH);
-    return true;
-  } catch { return false; }
+function clearRuntimeConfig() {
+  try { fs.unlinkSync(RUNTIME_PATH); return true; } catch { return false; }
 }
 
-// Candidate ports are for unauthenticated health probes only. Mutating hook
-// traffic never scans ports: it uses the token-bearing runtime record exactly.
-function getPortCandidates() {
+// Candidate ports to try, runtime-recorded port first. Accepts an optional
+// already-read runtime port so callers that just parsed runtime.json don't
+// pay a second synchronous read of the same file.
+function getPortCandidates(knownPort) {
   const out = [];
   const add = (p) => { const v = inRange(p); if (v && !out.includes(v)) out.push(v); };
-  const cfg = readRuntimeConfig();
-  add(cfg && cfg.port);
+  add(knownPort != null ? knownPort : readRuntimePort());
   PORTS.forEach(add);
   return out;
 }
 
 function buildPermissionUrl(port, token) {
-  const p = inRange(port) || BASE_PORT;
-  let t = validToken(token);
-  if (!t) {
-    const cfg = readRuntimeConfig();
-    if (cfg && cfg.port === p) t = cfg.token;
-  }
-  const suffix = t ? `?token=${encodeURIComponent(t)}` : '';
-  return `http://127.0.0.1:${p}${PERMISSION_PATH}${suffix}`;
+  const base = `http://127.0.0.1:${inRange(port) || BASE_PORT}${PERMISSION_PATH}`;
+  const t = validToken(token);
+  return t ? `${base}?token=${encodeURIComponent(t)}` : base;
 }
 
 function headerIsOurs(res) {
@@ -118,43 +102,47 @@ function headerIsOurs(res) {
 
 // Probe one port's GET /state; callback(true) if it's our server.
 function probe(port, timeoutMs, cb) {
-  let called = false;
-  const done = (ok) => { if (called) return; called = true; cb(!!ok); };
   const req = http.get({ hostname: '127.0.0.1', port, path: STATE_PATH, timeout: timeoutMs }, (res) => {
     res.resume();
-    done(headerIsOurs(res));
+    cb(headerIsOurs(res));
   });
-  req.on('error', () => done(false));
-  req.on('timeout', () => { req.destroy(); done(false); });
+  req.on('error', () => cb(false));
+  req.on('timeout', () => { req.destroy(); cb(false); });
 }
 
-// POST one state update using the authenticated runtime record. Best-effort and
-// fast: lifecycle hooks must never stall the coding agent.
+// POST a state body to the first reachable LLMPET server. Best-effort + fast:
+// the hook must not block Claude Code, so it gives up quickly on each port.
 function postState(body, cb) {
-  const runtime = readRuntimeConfig();
-  if (!runtime) { if (cb) cb(false); return; }
   const payload = typeof body === 'string' ? body : JSON.stringify(body);
-  let called = false;
-  const done = (ok) => { if (called) return; called = true; if (cb) cb(!!ok, runtime.port); };
-  const req = http.request(
-    {
-      hostname: '127.0.0.1', port: runtime.port, path: STATE_PATH, method: 'POST',
-      timeout: POST_TIMEOUT_MS,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        [TOKEN_HEADER]: runtime.token,
+  const runtime = readRuntimeConfig();
+  if (!runtime) { cb && cb(false); return; }
+  const ports = getPortCandidates(runtime.port);
+  let i = 0;
+  const tryNext = () => {
+    if (i >= ports.length) { cb && cb(false); return; }
+    const port = ports[i++];
+    const req = http.request(
+      {
+        hostname: '127.0.0.1', port, path: STATE_PATH, method: 'POST',
+        timeout: POST_TIMEOUT_MS,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          [TOKEN_HEADER]: runtime.token,
+        },
       },
-    },
-    (res) => {
-      const ok = res.statusCode === 200 && headerIsOurs(res);
-      res.resume();
-      done(ok);
-    }
-  );
-  req.on('error', () => done(false));
-  req.on('timeout', () => { req.destroy(); done(false); });
-  req.end(payload);
+      (res) => {
+        const ok = headerIsOurs(res) && res.statusCode >= 200 && res.statusCode < 300;
+        res.resume();
+        if (ok) cb && cb(true, port);
+        else tryNext();
+      }
+    );
+    req.on('error', tryNext);
+    req.on('timeout', () => { req.destroy(); tryNext(); });
+    req.end(payload);
+  };
+  tryNext();
 }
 
 // Resolve an absolute node binary for embedding in hook commands. Claude Code
@@ -228,6 +216,6 @@ function resolveWinNode() {
 
 module.exports = {
   SERVER_ID, SERVER_HEADER, TOKEN_HEADER, PORTS, BASE_PORT, STATE_PATH, PERMISSION_PATH, RUNTIME_PATH,
-  inRange, validToken, createRuntimeToken, readRuntimeConfig, readRuntimePort, writeRuntimeConfig, clearRuntimeConfig,
+  inRange, validToken, readRuntimeConfig, readRuntimePort, readRuntimeToken, writeRuntimeConfig, clearRuntimeConfig,
   getPortCandidates, buildPermissionUrl, headerIsOurs, probe, postState, resolveNodeBin,
 };

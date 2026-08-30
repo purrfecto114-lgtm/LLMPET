@@ -13,6 +13,7 @@
 // server. Field names are Claude Code's transcript format (a data interface).
 
 const fs = require('fs');
+const { loadPricing, normModelName } = require('./metering');
 
 const TAIL_BYTES = 256 * 1024;
 const ASSISTANT_MAX = 2200;
@@ -143,9 +144,18 @@ function lastAssistantText(entries, sid) {
 // never exceed the context window — so if observed usage tops the 200k window,
 // the session must be on the 1M window. This is what makes the % match the client
 // (otherwise long Opus sessions read >200k cached tokens and saturate at 100%).
-function contextLimit(model, used) {
+function contextLimit(model, used, pricing = null) {
   const m = String(model || '').toLowerCase();
   if (/(^|[^a-z0-9])1m([^a-z0-9]|$)/.test(m)) return CLAUDE_1M;
+  // The synced exact-model table carries LiteLLM's max_input_tokens. Prefer
+  // that authoritative per-model value over guessing 200K until usage crosses
+  // the threshold (which made a fresh 1M session display an inflated percent).
+  try {
+    const table = pricing || loadPricing();
+    const row = table && table._models && table._models[normModelName(model)];
+    const exact = Number(row && row.contextWindow);
+    if (Number.isFinite(exact) && exact > 0) return exact;
+  } catch {}
   if (Number(used) > CLAUDE_LIMIT) return CLAUDE_1M;
   return CLAUDE_LIMIT;
 }
@@ -209,4 +219,7 @@ function promptTitle(prompt) {
   return null;
 }
 
-module.exports = { readTail, lastAssistantText, contextUsage, apiError, apiErrorAfter, sessionTitle, promptTitle, clean, textFromContent, hasHistory, interruptedAfter };
+module.exports = {
+  readTail, lastAssistantText, contextUsage, contextLimit,
+  apiError, apiErrorAfter, sessionTitle, promptTitle, clean, hasHistory, interruptedAfter,
+};

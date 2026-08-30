@@ -196,7 +196,7 @@ func axWindows(pid: Int32) -> [AXUIElement] {
   }
 }
 
-func matchingAXPetWindow(pid: Int32, expected: CGRect) -> (CGWindowID, CGRect, Double)? {
+func matchingAXPetElement(pid: Int32, expected: CGRect) -> (AXUIElement, CGRect, Double)? {
   let candidates = axWindows(pid: pid).compactMap { window -> (CGWindowID, CGRect, Double)? in
     guard let position = axPoint(window, kAXPositionAttribute as CFString),
           let size = axSize(window, kAXSizeAttribute as CFString) else { return nil }
@@ -209,7 +209,21 @@ func matchingAXPetWindow(pid: Int32, expected: CGRect) -> (CGWindowID, CGRect, D
     let positionError = abs(position.x - expected.origin.x) + abs(position.y - expected.origin.y)
     return (windowID, bounds, shapeError * 10 + positionError)
   }
-  return candidates.min(by: { $0.2 < $1.2 })
+  guard let match = candidates.min(by: { $0.2 < $1.2 }) else { return nil }
+  guard let element = axWindows(pid: pid).first(where: { window in
+    var windowID = CGWindowID(0)
+    return AXUIElementGetWindow(window, &windowID) == .success && windowID == match.0
+  }) else { return nil }
+  return (element, match.1, match.2)
+}
+
+func matchingAXPetWindow(pid: Int32, expected: CGRect) -> (CGWindowID, CGRect, Double)? {
+  guard let (window, bounds, score) = matchingAXPetElement(pid: pid, expected: expected) else {
+    return nil
+  }
+  var windowID = CGWindowID(0)
+  guard AXUIElementGetWindow(window, &windowID) == .success, windowID != 0 else { return nil }
+  return (windowID, bounds, score)
 }
 
 func matchingPetWindow(pid: Int32, expectedX: Double, expectedY: Double,
@@ -284,6 +298,93 @@ func axString(_ element: AXUIElement, _ attribute: CFString) -> String? {
   var value: CFTypeRef?
   guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
   return value as? String
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+  var raw: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw) == .success,
+        let raw, CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
+  let array = unsafeBitCast(raw, to: CFArray.self)
+  return (0..<CFArrayGetCount(array)).map { index in
+    unsafeBitCast(CFArrayGetValueAtIndex(array, index), to: AXUIElement.self)
+  }
+}
+
+func axActionNames(_ element: AXUIElement) -> [String] {
+  var raw: CFArray?
+  guard AXUIElementCopyActionNames(element, &raw) == .success,
+        let values = raw as? [String] else { return [] }
+  return values
+}
+
+func findClosePetMenuItem(pid: Int32) -> AXUIElement? {
+  // Codex 自己的右键菜单是它公开的关闭入口；只接受这三个产品已支持语言的
+  // 精确文案，不能误按 ChatGPT 主窗口里的普通菜单项。
+  let accepted = Set(["Close pet", "关闭宠物", "關閉寵物", "ペットを閉じる"])
+  var pending = [AXUIElementCreateApplication(pid_t(pid))]
+  var inspected = 0
+  while let element = pending.popLast(), inspected < 20_000 {
+    inspected += 1
+    let role = axString(element, kAXRoleAttribute as CFString) ?? ""
+    let title = axString(element, kAXTitleAttribute as CFString) ?? ""
+    if role == (kAXMenuItemRole as String), accepted.contains(title),
+       axActionNames(element).contains(kAXPressAction as String) {
+      return element
+    }
+    pending.append(contentsOf: axChildren(element))
+  }
+  return nil
+}
+
+func openContextMenuWithRestoredCursor(at point: CGPoint) -> Bool {
+  guard !physicalMouseButtonIsDown(),
+        let original = CGEvent(source: nil)?.location else { return false }
+  let display = CGMainDisplayID()
+  guard CGDisplayHideCursor(display) == .success else { return false }
+  var restored = false
+  defer {
+    if !restored {
+      _ = CGWarpMouseCursorPosition(original)
+      _ = CGAssociateMouseAndMouseCursorPosition(1)
+      _ = CGDisplayShowCursor(display)
+    }
+  }
+  let source = CGEventSource(stateID: .hidSystemState)
+  guard CGWarpMouseCursorPosition(point) == .success else { return false }
+  if let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                        mouseCursorPosition: point, mouseButton: .left) {
+    move.post(tap: .cghidEventTap)
+  }
+  usleep(120_000)
+  guard let down = CGEvent(mouseEventSource: source, mouseType: .rightMouseDown,
+                           mouseCursorPosition: point, mouseButton: .right),
+        let up = CGEvent(mouseEventSource: source, mouseType: .rightMouseUp,
+                         mouseCursorPosition: point, mouseButton: .right) else { return false }
+  down.setIntegerValueField(.mouseEventClickState, value: 1)
+  up.setIntegerValueField(.mouseEventClickState, value: 1)
+  down.post(tap: .cghidEventTap)
+  usleep(35_000)
+  up.post(tap: .cghidEventTap)
+  usleep(80_000)
+  let warp = CGWarpMouseCursorPosition(original)
+  let associate = CGAssociateMouseAndMouseCursorPosition(1)
+  let show = CGDisplayShowCursor(display)
+  restored = warp == .success && associate == .success && show == .success
+  return restored
+}
+
+func findPromptTextArea(_ root: AXUIElement) -> AXUIElement? {
+  var pending = [root]
+  var inspected = 0
+  while let element = pending.popLast(), inspected < 20_000 {
+    inspected += 1
+    if axString(element, kAXRoleAttribute as CFString) == (kAXTextAreaRole as String),
+       axString(element, kAXDescriptionAttribute as CFString) == "Prompt" {
+      return element
+    }
+    pending.append(contentsOf: axChildren(element))
+  }
+  return nil
 }
 
 func axElement(_ element: AXUIElement, _ attribute: CFString) -> AXUIElement? {
@@ -376,6 +477,8 @@ final class TargetedMouseTransport {
     case .leftMouseDown: nsType = .leftMouseDown
     case .leftMouseDragged: nsType = .leftMouseDragged
     case .leftMouseUp: nsType = .leftMouseUp
+    case .rightMouseDown: nsType = .rightMouseDown
+    case .rightMouseUp: nsType = .rightMouseUp
     default: return false
     }
     // Window coordinates use AppKit's bottom-left origin even though the
@@ -383,8 +486,11 @@ final class TargetedMouseTransport {
     let local = CGPoint(
       x: point.x - logicalBounds.origin.x,
       y: logicalBounds.height - (point.y - logicalBounds.origin.y))
-    let clickCount = type == .leftMouseDown || type == .leftMouseUp ? 1 : 0
-    let pressure: Float = type == .leftMouseUp || type == .mouseMoved ? 0 : 1
+    let buttonEvent = type == .leftMouseDown || type == .leftMouseUp
+      || type == .rightMouseDown || type == .rightMouseUp
+    let releaseEvent = type == .leftMouseUp || type == .rightMouseUp
+    let clickCount = buttonEvent ? 1 : 0
+    let pressure: Float = releaseEvent || type == .mouseMoved ? 0 : 1
     guard let nsEvent = NSEvent.mouseEvent(
       with: nsType,
       location: local,
@@ -404,12 +510,12 @@ final class TargetedMouseTransport {
                                value: Int64(targetWindowID))
     CGEventSetWindowLocation(event, local)
     event.setIntegerValueField(.mouseEventNumber, value: eventNumber)
-    if type == .leftMouseDown || type == .leftMouseUp {
+    if buttonEvent {
       event.setIntegerValueField(.mouseEventClickState, value: 1)
     }
     event.setDoubleValueField(.mouseEventPressure, value: Double(pressure))
     guard SLEventPostToPid(targetPid, event) == 0 else { return false }
-    if type == .leftMouseUp { eventNumber += 1 }
+    if releaseEvent { eventNumber += 1 }
     return true
   }
 
@@ -427,6 +533,139 @@ func physicalMouseButtonIsDown() -> Bool {
 }
 
 let windowCommand = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+// Close only the exact desktop-pet window. Never terminate the host process:
+// ChatGPT/Codex keeps its main client window and login state untouched.
+if windowCommand == "--close-window" && CommandLine.arguments.count >= 7 {
+  guard AXIsProcessTrusted() else {
+    fputs("accessibility permission required\n", stderr)
+    exit(3)
+  }
+  guard let pid = Int32(CommandLine.arguments[2]),
+        let expectedX = Double(CommandLine.arguments[3]),
+        let expectedY = Double(CommandLine.arguments[4]),
+        let expectedW = Double(CommandLine.arguments[5]),
+        let expectedH = Double(CommandLine.arguments[6]) else {
+    fputs("bad --close-window arguments\n", stderr)
+    exit(2)
+  }
+  let expected = CGRect(x: expectedX, y: expectedY, width: expectedW, height: expectedH)
+  guard let (window, bounds, score) = matchingAXPetElement(pid: pid, expected: expected),
+        score <= 80 else {
+    fputs("matching pet window not found\n", stderr)
+    exit(4)
+  }
+  if let closeButton = axElement(window, kAXCloseButtonAttribute as CFString) {
+    let result = AXUIElementPerformAction(closeButton, kAXPressAction as CFString)
+    guard result == .success else {
+      fputs("close action failed: \(result.rawValue)\n", stderr)
+      exit(6)
+    }
+    print("closed|ax-button|\(pid)|\(bounds.origin.x)|\(bounds.origin.y)|\(bounds.width)|\(bounds.height)")
+    exit(0)
+  }
+
+  // 新版原生 Codex Pet 是无标题 AXSystemDialog，不暴露 AXCloseButton；它公开
+  // 的安全关闭入口是桌宠右键菜单里的 “Close pet/关闭宠物/ペットを閉じる”。
+  // 对精确匹配的 mascot 窗口投递定向右键，不 warp/隐藏/占用用户真鼠标，随后
+  // 只按这个菜单项。这样关闭 overlay 而不是 terminate ChatGPT/Codex 宿主。
+  guard let (windowID, serverBounds, serverScore) = matchingPetWindow(
+          pid: pid, expectedX: bounds.origin.x, expectedY: bounds.origin.y,
+          expectedW: bounds.width, expectedH: bounds.height), serverScore <= 80 else {
+    fputs("matching pet window has no close button and no exact server surface\n", stderr)
+    exit(5)
+  }
+  let transport = TargetedMouseTransport(
+    targetPid: pid, targetWindowID: windowID, logicalBounds: serverBounds)
+  var menuItem: AXUIElement?
+  // 中央可能被 Codex 自己的 Computer Use controls 覆盖。新版 243×253
+  // viewport 的可见 mascot 从 x≈81 开始，所以先试左侧仍属于本体的窄带，
+  // 再试中心和右侧；普通状态下三者都命中同一个桌宠 renderer。
+  let points = [
+    CGPoint(x: serverBounds.minX + serverBounds.width * 0.345, y: serverBounds.midY),
+    CGPoint(x: serverBounds.midX, y: serverBounds.midY),
+    CGPoint(x: serverBounds.minX + serverBounds.width * 0.655, y: serverBounds.midY),
+  ]
+  for point in points where menuItem == nil {
+    let targetedDown = transport.post(.rightMouseDown, at: point)
+    let targetedUp = transport.post(.rightMouseUp, at: point)
+    if targetedDown && targetedUp {
+      for _ in 0..<6 {
+        usleep(50_000)
+        if let found = findClosePetMenuItem(pid: pid) { menuItem = found; break }
+      }
+    }
+    if menuItem == nil, openContextMenuWithRestoredCursor(at: point) {
+      for _ in 0..<8 {
+        usleep(50_000)
+        if let found = findClosePetMenuItem(pid: pid) { menuItem = found; break }
+      }
+    }
+  }
+  guard let menuItem else {
+    fputs("Codex pet close menu item not found\n", stderr)
+    exit(5)
+  }
+  let menuResult = AXUIElementPerformAction(menuItem, kAXPressAction as CFString)
+  guard menuResult == .success else {
+    fputs("Codex pet close menu action failed: \(menuResult.rawValue)\n", stderr)
+    exit(6)
+  }
+  print("closed|context-menu|\(pid)|\(bounds.origin.x)|\(bounds.origin.y)|\(bounds.width)|\(bounds.height)")
+  exit(0)
+}
+
+if windowCommand == "--set-claude-prompt" && CommandLine.arguments.count >= 3 {
+  guard AXIsProcessTrusted() else {
+    fputs("accessibility permission required\n", stderr)
+    exit(3)
+  }
+  guard let app = NSRunningApplication.runningApplications(
+    withBundleIdentifier: "com.anthropic.claudefordesktop").first else {
+    fputs("claude-not-running\n", stderr)
+    exit(4)
+  }
+  let pid = Int32(app.processIdentifier)
+  let application = AXUIElementCreateApplication(pid_t(pid))
+  guard let promptArea = findPromptTextArea(application) else {
+    fputs("prompt-not-found\n", stderr)
+    exit(4)
+  }
+  let prompt = CommandLine.arguments[2] as CFString
+  guard AXUIElementSetAttributeValue(
+    promptArea, kAXValueAttribute as CFString, prompt) == .success else {
+    fputs("prompt-write-failed\n", stderr)
+    exit(5)
+  }
+  _ = AXUIElementSetAttributeValue(
+    promptArea, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+  if let window = axElement(promptArea, kAXWindowAttribute as CFString) {
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+  }
+  app.activate(options: [])
+  usleep(120_000)
+  if CommandLine.arguments.count > 3 && CommandLine.arguments[3] == "submit" {
+    let source = CGEventSource(stateID: .privateState)
+    guard let down = CGEvent(
+      keyboardEventSource: source, virtualKey: 36, keyDown: true),
+      let up = CGEvent(
+        keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+      fputs("submit-event-failed\n", stderr)
+      exit(5)
+    }
+    guard SLEventPostToPid(pid, down) == 0 else {
+      fputs("submit-key-down-failed\n", stderr)
+      exit(5)
+    }
+    usleep(25_000)
+    guard SLEventPostToPid(pid, up) == 0 else {
+      fputs("submit-key-up-failed\n", stderr)
+      exit(5)
+    }
+  }
+  print("ok")
+  exit(0)
+}
+
 if windowCommand == "--inspect-pid" && CommandLine.arguments.count >= 3 {
   guard let pid = Int32(CommandLine.arguments[2]) else {
     fputs("bad --inspect-pid argument\n", stderr)
@@ -441,6 +680,7 @@ if windowCommand == "--inspect-pid" && CommandLine.arguments.count >= 3 {
     let subrole = axString(window, kAXSubroleAttribute as CFString) ?? ""
     let title = axString(window, kAXTitleAttribute as CFString) ?? ""
     print("ax|\(windowID)|\(position.x)|\(position.y)|\(size.width)|\(size.height)|\(role)|\(subrole)|\(title)")
+    print("actions|\(windowID)|\(axActionNames(window).joined(separator: ","))")
   }
   let rows = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)
     as? [[String: Any]]) ?? []
@@ -459,6 +699,51 @@ if windowCommand == "--inspect-pid" && CommandLine.arguments.count >= 3 {
     let name = (info[kCGWindowName as String] as? String) ?? ""
     print("cg|\(number.uint32Value)|\(bounds.origin.x)|\(bounds.origin.y)|\(bounds.width)|\(bounds.height)|\(layer)|\(alpha)|\(onscreen)|\(sharing)|\(store)|\(memory)|\(name)")
   }
+  exit(0)
+}
+
+// 新版 Codex 桌宠(243x253)接受 AXPosition 写入,但 System Events 的
+// AXPosition setter 对它静默 no-op,只有直调 AX C API 才真正生效。
+// 用法: --move-window pid ew eh nx ny → 按预期尺寸(±24)找 AX 窗,写入新
+// 位置,等一拍后读回。输出 "moved|旧x|旧y|新x|新y";找不到匹配窗输出 gone。
+if windowCommand == "--move-window" && CommandLine.arguments.count >= 7 {
+  guard AXIsProcessTrusted(),
+        let pid = Int32(CommandLine.arguments[2]),
+        let expectedW = Double(CommandLine.arguments[3]),
+        let expectedH = Double(CommandLine.arguments[4]),
+        let nx = Double(CommandLine.arguments[5]),
+        let ny = Double(CommandLine.arguments[6]) else {
+    fputs("bad --move-window arguments or accessibility permission missing\n", stderr)
+    exit(2)
+  }
+  var bestWindow: AXUIElement?
+  var bestScore = Double.infinity
+  for window in axWindows(pid: pid) {
+    guard let size = axSize(window, kAXSizeAttribute as CFString) else { continue }
+    let score = abs(size.width - expectedW) + abs(size.height - expectedH)
+    guard score <= 24, score < bestScore else { continue }
+    bestScore = score
+    bestWindow = window
+  }
+  guard let window = bestWindow,
+        let before = axPoint(window, kAXPositionAttribute as CFString) else {
+    print("gone")
+    exit(0)
+  }
+  var target = CGPoint(x: nx, y: ny)
+  guard let value = AXValueCreate(.cgPoint, &target) else {
+    fputs("could not build AXValue\n", stderr)
+    exit(4)
+  }
+  let result = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+  guard result == .success else {
+    fputs("AXPosition write failed: \(result.rawValue)\n", stderr)
+    exit(5)
+  }
+  // 写入是异步应用的,立即读会拿到旧值;等一拍再读真实落点。
+  usleep(250_000)
+  let after = axPoint(window, kAXPositionAttribute as CFString) ?? target
+  print("moved|\(before.x)|\(before.y)|\(after.x)|\(after.y)")
   exit(0)
 }
 
@@ -760,6 +1045,11 @@ if windowCommand == "--isolated-drag-pid" && CommandLine.arguments.count >= 12 {
   }
   let durationMs = max(180, min(1500,
     Double(CommandLine.arguments[11]) ?? 520))
+  // Codex 机器人桌宠的窗口对 AX hit-test 永远隐身(冷查/hover 后都解析不到),
+  // 但 WindowServer 的真实 HID 事件路由是通的——drag 实测能移动它。对这类
+  // 目标跳过命中门,成功与否交给 JS 侧的 AX frame 位移复核。
+  let skipHitGate = CommandLine.arguments.count > 12
+    && CommandLine.arguments[12] == "nogate"
   let steps = max(12, Int(durationMs / 16))
   let source = CGEventSource(stateID: .hidSystemState)
   guard let original = CGEvent(source: nil)?.location else {
@@ -821,15 +1111,19 @@ if windowCommand == "--isolated-drag-pid" && CommandLine.arguments.count >= 12 {
   post(.mouseMoved, start)
   usleep(35_000)
   let expected = CGRect(x: expectedX, y: expectedY, width: expectedW, height: expectedH)
-  guard matchingHitWindow(at: start, pid: targetPid, expected: expected) else {
-    let restoreResults = restoreCursor()
-    cursorRestored = restoreResults.0 == .success
-      && restoreResults.1 == .success && restoreResults.2 == .success
-    print("hit|target=0")
-    print("restore|warp=\(restoreResults.0.rawValue)|associate=\(restoreResults.1.rawValue)|show=\(restoreResults.2.rawValue)")
-    exit(7)
+  if skipHitGate {
+    print("hit|target=skipped")
+  } else {
+    guard matchingHitWindow(at: start, pid: targetPid, expected: expected) else {
+      let restoreResults = restoreCursor()
+      cursorRestored = restoreResults.0 == .success
+        && restoreResults.1 == .success && restoreResults.2 == .success
+      print("hit|target=0")
+      print("restore|warp=\(restoreResults.0.rawValue)|associate=\(restoreResults.1.rawValue)|show=\(restoreResults.2.rawValue)")
+      exit(7)
+    }
+    print("hit|target=1")
   }
-  print("hit|target=1")
   post(.leftMouseDown, start)
   mouseIsDown = true
   usleep(80_000)

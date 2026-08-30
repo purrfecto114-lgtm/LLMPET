@@ -6,14 +6,14 @@
 
 const fs = require('fs');
 const path = require('path');
-const { registerHooks, unregisterHooks, markerPresent, SETTINGS_PATH } = require('./hookinstall');
+const { registerHooks, unregisterHooks, hooksCurrent, SETTINGS_PATH } = require('./hookinstall');
 const { log } = require('./log');
 
 const SETTINGS_DIR = path.dirname(SETTINGS_PATH);
 
-function install(port) {
+function install(port, token) {
   try {
-    const r = registerHooks(port);
+    const r = registerHooks(port, token);
     log('hooks', `installed (port ${port}) added=${r.added} updated=${r.updated} skipped=${r.skipped} purged=${r.purged || 0} node=${r.nodeBin}`);
     return r;
   } catch (err) {
@@ -34,21 +34,19 @@ function uninstall() {
 }
 
 // Watch the ~/.claude directory (not the file — atomic renames swap the inode).
-function startWatcher(getPort) {
+function startWatcher(getRuntime) {
   let watcher = null;
   let debounce = null;
-  let stopped = false; // W17: guard against stale debounce firing after stop
   try {
     fs.mkdirSync(SETTINGS_DIR, { recursive: true });
     watcher = fs.watch(SETTINGS_DIR, (_e, filename) => {
-      if (stopped) return; // W17: ignore events after stop
       if (filename && filename !== 'settings.json') return;
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
-        if (stopped) return; // W17: double-check inside debounce callback
-        if (!markerPresent()) {
-          log('hooks', 'settings.json lost our hooks — re-registering');
-          install(getPort());
+        const runtime = getRuntime();
+        if (!runtime || !hooksCurrent(runtime.port, runtime.token)) {
+          log('hooks', 'settings.json lost or changed our hooks — re-registering');
+          if (runtime) install(runtime.port, runtime.token);
         }
       }, 800);
       if (debounce.unref) debounce.unref();
@@ -57,15 +55,7 @@ function startWatcher(getPort) {
   } catch (err) {
     log('hooks', 'watcher failed:', err.message);
   }
-  // W17: clear debounce AND close watcher AND set stopped flag. Previously
-  // only the watcher was closed, leaving a pending debounce timer that could
-  // fire 800ms later and re-register hooks — silently undoing an uninstall
-  // and "locking" Claude Code back to the pet.
-  return () => {
-    stopped = true;
-    if (debounce) { clearTimeout(debounce); debounce = null; }
-    if (watcher) { try { watcher.close(); } catch {} }
-  };
+  return () => { if (watcher) { try { watcher.close(); } catch {} } };
 }
 
-module.exports = { install, uninstall, startWatcher, markerPresent, SETTINGS_PATH };
+module.exports = { install, uninstall, startWatcher, hooksCurrent, SETTINGS_PATH };

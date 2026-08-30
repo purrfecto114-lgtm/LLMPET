@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 'use strict';
 
-// Octopus hook — run by Claude Code as: node octopus-hook.js <Event>
+// LLMPET compatibility hook — run by Claude Code as: node octopus-hook.js <Event>
 //
 // Reads the hook's stdin JSON, derives a pet state, enriches it from the session
 // transcript (Claude's last message, context usage, API errors, title), figures
 // out which terminal owns the session (for "去回复" focus), and POSTs it to the
-// running Octopus server. Must be fast and never throw — Claude Code waits on it.
+// running LLMPET server. Must be fast and never throw — Claude Code waits on it.
 
 const transport = require('../backend/transport');
 const transcript = require('../backend/transcript');
@@ -28,39 +28,25 @@ const EVENT_STATE = {
   PostCompact: 'thinking',
   Notification: 'notification',
   Elicitation: 'notification',
+  // Current Claude Code emits this paired edge after the user answers an MCP
+  // elicitation. Without it a quiet session can stay stuck in needsinput until
+  // some unrelated later tool event happens to clear the state.
+  ElicitationResult: 'working',
 };
 const FOCUS_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PreToolUse']);
-const STDIN_MAX_BYTES = 1024 * 1024;
 
 function readStdin() {
   return new Promise((resolve) => {
     const chunks = [];
-    let bytes = 0;
-    let tooLarge = false;
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
       let payload = {};
-      try {
-        if (!tooLarge) {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          if (raw.trim()) payload = JSON.parse(raw);
-        }
-      } catch {}
+      try { const raw = Buffer.concat(chunks).toString('utf8'); if (raw.trim()) payload = JSON.parse(raw); } catch {}
       resolve(payload);
     };
-    process.stdin.on('data', (c) => {
-      if (tooLarge) return;
-      bytes += c.length;
-      if (bytes > STDIN_MAX_BYTES) {
-        tooLarge = true;
-        chunks.length = 0;
-        finish();
-        return;
-      }
-      chunks.push(c);
-    });
+    process.stdin.on('data', (c) => chunks.push(c));
     process.stdin.on('end', finish);
     process.stdin.on('error', finish);
     setTimeout(finish, 300);
@@ -73,7 +59,7 @@ function buildBody(event, p) {
   let state = EVENT_STATE[event];
   if (!state) return null;
   // A subagent launch may surface as PreToolUse(Task) without SubagentStart.
-  if (event === 'PreToolUse' && p.tool_name === 'Task') state = 'juggling';
+  if (event === 'PreToolUse' && (p.tool_name === 'Task' || p.tool_name === 'Agent')) state = 'juggling';
   // /clear shows up as SessionEnd(source=clear) → context sweep, not sleep.
   if (event === 'SessionEnd' && (p.source === 'clear' || p.reason === 'clear')) state = 'sweeping';
   // Manual /compact ends a turn (settle to idle); auto-compact keeps working.
@@ -104,9 +90,9 @@ function buildBody(event, p) {
   // Transcript-derived enrichment (read the tail once).
   const entries = transcript.readTail(p.transcript_path);
 
-  // SessionStart 来源（startup/resume/clear/compact）：只有 startup 是真·新对话，
-  // resume/compact 进入已有任务不该触发「新会话欢迎」。有的环境（ccd）不带
-  // source —— 用 transcript 是否已有正式对话兜底判定。
+  // SessionStart 来源（startup/resume/clear/compact）保留作为诊断元数据。
+  // 欢迎是否可见由 core/adapter 以 session 身份判定；新激活的 resume
+  // 同样需要表情，不能在 hook 层用 source 静默。
   if (event === 'SessionStart') {
     body.session_source = (typeof p.source === 'string' && p.source)
       ? p.source
@@ -146,14 +132,23 @@ function buildBody(event, p) {
     if (emo) body.assistant_emotion = emo;
   }
 
-  // Terminal ownership for focus + headless detection.
-  if (FOCUS_EVENTS.has(event)) {
+  // `claude --resume -p` launched by a meme action belongs to the user-selected
+  // original session. Do not overwrite that session's focus route/headless bit
+  // with the short-lived resume process, and do not retire it on CLI exit.
+  const memeResume = process.env.LLMPET_MEME_RESUME === '1';
+  if (memeResume) {
+    body.headless = false;
+    body.external_resume = true;
+  } else if (FOCUS_EVENTS.has(event)) {
     try {
-      const r = pidwalk.resolve();
+      const r = pidwalk.resolve(process.ppid, 10, sid);
       if (r.sourcePid) body.source_pid = r.sourcePid;
       if (r.pidChain && r.pidChain.length) body.pid_chain = r.pidChain;
       if (r.editor) body.editor = r.editor;
       if (r.tmuxSocket) body.tmux_socket = r.tmuxSocket;
+      if (r.tmuxClient) body.tmux_client = r.tmuxClient;
+      if (r.terminalApp) body.terminal_app = r.terminalApp;
+      if (r.terminalTty) body.terminal_tty = r.terminalTty;
       body.headless = r.headless === true; // background `claude -p` runs
     } catch {}
   }

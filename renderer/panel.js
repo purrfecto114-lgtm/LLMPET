@@ -1,24 +1,15 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-let config = { mode: 'pet', skin: 'mascot', budget5h: 0, currency: 'USD', fxRate: 7.2 };
-
-// Format cost with current currency symbol (supports USD → $, CNY → ¥).
-// Cost values in stats are always USD; CNY display applies fxRate conversion.
-function fmtCost(cost, currency, fxRate) {
-  const n = Number(cost) || 0;
-  const cur = (currency || config.currency || 'USD');
-  const rate = Number.isFinite(fxRate || config.fxRate) && (fxRate || config.fxRate) > 0
-    ? (fxRate || config.fxRate) : 7.2;
-  const sym = cur === 'CNY' ? '¥' : '$';
-  const display = cur === 'CNY' ? n * rate : n;
-  if (Math.abs(display) < 1) return sym + display.toFixed(3);
-  if (Math.abs(display) < 100) return sym + display.toFixed(2);
-  return sym + display.toFixed(1);
-}
+let config = { mode: 'pet', skin: 'mascot' };
 let lastOpKey = null;
+const t = (key, vars) => window.OctoI18n.t(key, vars);
+// Date formatting follows the UI language, not the OS locale.
+const LOCALE_TAG = { zh: 'zh-CN', en: 'en-US', ja: 'ja-JP' };
+
 let hoursSummary = ''; // 24h 视图默认读数（鼠标移开时恢复）
 let calSummary = '';   // 日历默认读数
+let usageMetric = 'tokens';
 const dKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 function fmt(n) {
@@ -29,60 +20,86 @@ function fmt(n) {
 }
 function timeStr(ts) {
   const d = new Date(ts);
-  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  // Follow the UI language like the other date formatters below; a hardcoded
+  // zh-CN made the ops column render Chinese-formatted times in en/ja UIs.
+  return d.toLocaleTimeString(LOCALE_TAG[window.OctoI18n.getLang()] || 'zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 function shortModel(m) {
   if (!m) return '?';
   return String(m).replace(/^claude-/, '').replace(/\[1m\]/, '·1M');
 }
 
+let lastStats = null; // kept so a language switch can relabel without a new push
+const hasBillingLedger = (stats) => !!(
+  stats && stats.billingAvailable !== false && !['dsh', 'unknown'].includes(stats.usageProvider)
+);
+
+function renderUnavailableUsage() {
+  $('chart').innerHTML = '';
+  $('cal').innerHTML = '';
+  hoursSummary = '—';
+  calSummary = '—';
+  $('hours-readout').textContent = hoursSummary;
+  $('cal-readout').textContent = calSummary;
+}
+
 function render(s) {
   if (!s) return;
+  lastStats = s;
   // 头部
   if (s.active && s.active.project) {
     $('active-sub').textContent = `${s.active.project} · ${shortModel(s.active.model)}`;
   }
-  // 大数
-  $('today-cost').textContent = fmtCost(s.today.cost || 0);
-  $('today-tokens').textContent = fmt(s.today.tokens) + ' tokens · ' + s.today.messages + ' 轮';
-  $('win-cost').textContent = fmtCost(s.window5h.cost || 0);
-  if (s.window5h.tokens > 0 && s.window5h.resetTs) {
-    $('win-reset').textContent = fmt(s.window5h.tokens) + ' tok · ' + timeStr(s.window5h.resetTs) + ' 重置';
+  const billingAvailable = hasBillingLedger(s);
+  // 大数：Claude + Codex 合计，下方给出两家的拆分（只有一家有量时不显示拆分）。
+  // A dsh/unknown-only snapshot has no attributable price ledger; render a
+  // neutral dash rather than turning somebody else's spend into a $0/combined
+  // bill for that provider.
+  if (billingAvailable) {
+    $('today-cost').textContent = '$' + (s.today.cost || 0).toFixed(3);
+    $('today-tokens').textContent = fmt(s.today.tokens) + ' tokens · ' + s.today.messages + t('panel.rounds');
+    renderSplit('today-split', s.todayByProvider);
+    $('win-cost').textContent = '$' + (s.lifetime.cost || 0).toFixed(3);
+    $('win-reset').textContent = fmt(s.lifetime.tokens) + ' tokens · ' + s.lifetime.messages + t('panel.rounds');
+    renderSplit('win-split', s.lifetimeByProvider);
   } else {
-    $('win-reset').textContent = '窗口空闲';
+    $('today-cost').textContent = '—';
+    $('today-tokens').textContent = '—';
+    $('win-cost').textContent = '—';
+    $('win-reset').textContent = '—';
+    renderSplit('today-split', null);
+    renderSplit('win-split', null);
   }
 
-  // 预算条
-  if (config.budget5h > 0) {
-    $('budget-wrap').classList.remove('hidden');
-    const pct = Math.min(100, (s.window5h.cost / config.budget5h) * 100);
-    $('budget-pct').textContent = pct.toFixed(0) + '%';
-    const fill = $('budget-fill');
-    fill.style.width = pct + '%';
-    fill.classList.toggle('warn', pct >= 80);
-  } else {
-    $('budget-wrap').classList.add('hidden');
+  // token 明细：这一块的行是 Claude 的缓存 TTL 语义（5m/1h 写入），Codex 没有
+  // 对应字段，所以取 Claude 那一侧而不是合计——否则标题和数字对不上。
+  const claudeToday = billingAvailable
+    ? (s.todayByProvider && s.todayByProvider.claude) || s.today
+    : null;
+  for (const id of ['t-in', 't-out', 't-cw5', 't-cw1', 't-cr', 't-msg']) $(id).textContent = '—';
+  if (claudeToday) {
+    $('t-in').textContent = fmt(claudeToday.input);
+    $('t-out').textContent = fmt(claudeToday.output);
+    $('t-cw5').textContent = fmt(claudeToday.cacheWrite5m);
+    $('t-cw1').textContent = fmt(claudeToday.cacheWrite1h);
+    $('t-cr').textContent = fmt(claudeToday.cacheRead);
+    $('t-msg').textContent = claudeToday.messages;
   }
 
-  // token 明细
-  $('t-in').textContent = fmt(s.today.input);
-  $('t-out').textContent = fmt(s.today.output);
-  $('t-cw').textContent = fmt(s.today.cacheCreate);
-  $('t-cr').textContent = fmt(s.today.cacheRead);
-  $('t-msg').textContent = s.today.messages;
-
-  // 按 provider 花费（今日）
-  renderProviderCost(s.providerCost);
+  renderCodexUsage(billingAvailable ? s.codexUsage : null, billingAvailable ? s.codexDiagnostics : null);
+  renderDiagnostics(billingAvailable ? s.diagnostics : null);
 
   // 按模型（有总有分：每模型 cost + 占比条 + in/out/cache 四元组明细，末行合计）
-  renderByModel(s.byModel || {});
+  renderByModel(billingAvailable ? (s.byModel || {}) : {});
 
   // 待办清单
   renderTodos(s.todos || [], s.todosProject || '');
 
   // 用量趋势：24h + 日历
-  renderChart(s.hourly || []);
-  renderCal(s.daily || {});
+  if (billingAvailable) {
+    renderChart(s.hourly || [], s.hourlyTok || []);
+    renderCal(s.daily || {});
+  } else renderUnavailableUsage();
 
   // 进行中的任务（各会话状态）
   renderSessList(s.sessions || []);
@@ -94,7 +111,7 @@ function render(s) {
   const ops = s.lastOps || [];
   const list = $('ops');
   if (ops.length === 0) {
-    list.innerHTML = '<li class="empty">等待操作…</li>';
+    list.innerHTML = '<li class="empty">' + escapeHtml(t('panel.waitingOps')) + '</li>';
   } else {
     const topKey = ops[0].ts + ops[0].detail;
     const isNew = topKey !== lastOpKey;
@@ -102,11 +119,32 @@ function render(s) {
     list.innerHTML = ops
       .map(
         (o, i) =>
-          `<li class="${i === 0 && isNew ? 'new' : ''}"><span>${escapeHtml(o.icon || '🔧')}</span><span>${escapeHtml(o.detail)}</span><span class="op-proj">${escapeHtml(o.project || '')}</span><span class="op-time">${timeStr(o.ts)}</span></li>`
+          `<li class="${i === 0 && isNew ? 'new' : ''}"><span>${o.icon || '🔧'}</span><span>${escapeHtml(o.detail)}</span><span class="op-proj">${escapeHtml(o.project || '')}</span><span class="op-time">${timeStr(o.ts)}</span></li>`
       )
       .join('');
   }
   fitPanelHeight();
+}
+
+// 合计大数下方的按家拆分。只有一家有量时留空——单 agent 的机器不该看到
+// 「Codex $0.000」这种噪音。没有 CodeWhale 花费的机器保持上游两方文案不变；
+// CodeWhale 也有量时动态拼接（Claude/Codex/CodeWhale 是专有名词，三语言一致），
+// 否则「合计 > 拆分之和」的矛盾数字会出现在面板上。
+function renderSplit(id, byProvider) {
+  const el = $(id);
+  if (!el) return;
+  const cost = (k) => (byProvider && byProvider[k] && byProvider[k].cost) || 0;
+  const claude = cost('claude');
+  const codex = cost('codex');
+  const codewhale = cost('codewhale');
+  if (codewhale <= 0) {
+    if (claude <= 0 || codex <= 0) { el.textContent = ''; return; }
+    el.textContent = t('panel.providerSplit', { claude: claude.toFixed(2), codex: codex.toFixed(2) });
+    return;
+  }
+  const rows = [['Claude', claude], ['Codex', codex], ['CodeWhale', codewhale]].filter(([, c]) => c > 0);
+  if (rows.length < 2) { el.textContent = ''; return; }
+  el.textContent = rows.map(([name, c]) => `${name} $${c.toFixed(2)}`).join(' · ');
 }
 
 // 面板按内容高度自适应：量出内容底边（footer 底）到卡片顶的距离，通知主进程调窗口高，
@@ -128,96 +166,126 @@ function fitPanelHeight() {
 // 按模型明细：每模型一行 = 名称 + 占比条 + $花费 + token/占比；下方灰字给出
 // 入/出/缓写/缓读 四元组与轮次；最后一行合计。数据里没有明细字段（旧数据）时只
 // 显示头行，跑一次 `npm run meter:rebuild` 可回填历史明细。
-// Round 12-拓展: per-provider cost breakdown (today).
-const PCOST_META = {
-  claude: { icon: '🐙', label: 'Claude Code' },
-  codewhale: { icon: '🐋', label: 'CodeWhale' },
-  aider: { icon: '🤖', label: 'Aider' },
-};
-function renderProviderCost(providerCost) {
-  const el = $('provider-cost');
-  const block = $('provider-cost-block');
-  if (!el) return;
-  const entries = Object.entries(providerCost || {});
-  // Hide the whole block if no provider has any cost data.
-  const hasData = entries.some(([, v]) => (v.cost || 0) > 0 || (v.tokens || 0) > 0);
-  if (block) block.style.display = hasData ? '' : 'none';
-  if (!hasData) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
-  const totalCost = entries.reduce((s, [, v]) => s + (v.cost || 0), 0);
-  const base = totalCost || 1;
-  let html = '';
-  for (const [id, v] of entries) {
-    const m = PCOST_META[id] || { icon: '❓', label: id };
-    const pct = Math.round(((v.cost || 0) / base) * 100);
-    html += `<div class="row pcost-row">`
-      + `<span class="pcost-name">${escapeHtml(m.icon)} ${escapeHtml(m.label)}</span>`
-      + `<span class="pcost-bar-wrap"><span class="pcost-bar" style="width:${pct}%"></span></span>`
-       + `<b>${fmtCost(v.cost || 0)}</b>`
-      + `<span class="pcost-sub">${fmt(v.tokens)} tok · ${v.messages || 0} 轮</span>`
-      + `</div>`;
-  }
-  el.innerHTML = html;
-}
-
 function renderByModel(byModel) {
   const bm = $('by-model');
   const entries = Object.entries(byModel).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0));
-  if (!entries.length) { bm.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  if (!entries.length) { bm.innerHTML = '<div class="empty">' + escapeHtml(t('panel.noData')) + '</div>'; return; }
   const totCost = entries.reduce((s, [, v]) => s + (v.cost || 0), 0);
   const totTok = entries.reduce((s, [, v]) => s + (v.tokens || 0), 0);
   const base = totCost || 1;
   let html = '';
   for (const [model, v] of entries) {
     const pct = Math.round(((v.cost || 0) / base) * 100);
-    const hasDetail = (v.input || v.output || v.cacheCreate || v.cacheRead);
+    // 两家的 token 分类不同：Claude 是 5m/1h 缓存写 + 缓存读，Codex 是缓存输入 +
+    // 推理输出，各用各的明细模板，不硬塞进同一行。
+    const hasDetail = (v.input || v.output || v.cacheCreate || v.cacheRead || v.cachedInput);
+    const body = v.agent === 'codex'
+      ? t('panel.codexBreakdown', {
+        in: fmt(v.input), out: fmt(v.output),
+        cached: fmt(v.cachedInput), reasoning: fmt(v.reasoningOutput),
+      })
+      : t('panel.modelDetail', {
+        in: fmt(v.input), out: fmt(v.output),
+        cw5: fmt(v.cacheWrite5m), cw1: fmt(v.cacheWrite1h), cr: fmt(v.cacheRead),
+      });
     const detail = hasDetail
-      ? `<div class="m-detail">入 ${fmt(v.input)} · 出 ${fmt(v.output)} · 缓写 ${fmt(v.cacheCreate)} · 缓读 ${fmt(v.cacheRead)}${v.msgs ? ' · ' + v.msgs + ' 轮' : ''}</div>`
+      ? `<div class="m-detail">${escapeHtml(body)}${v.msgs ? escapeHtml(t('panel.modelRounds', { n: v.msgs })) : ''}</div>`
       : '';
+    // Codex 与 Claude 现在同列，加来源小图标区分（与会话列表同款）
+    const icon = AGENT_ICON[v.agent] || AGENT_ICON.claude;
     html += `<div class="m-item">`
-      + `<div class="m-head"><span class="mc">${escapeHtml(shortModel(model))}</span>`
+      + `<div class="m-head"><span class="m-agent">${icon}</span><span class="mc">${escapeHtml(shortModel(model))}</span>`
       + `<span class="m-bar"><i style="width:${pct}%"></i></span>`
-       + `<b class="m-cost">${fmtCost(v.cost || 0)}</b>`
-       + `<span class="m-tok">${fmt(v.tokens)} · ${pct}%</span></div>`
-       + detail + `</div>`;
-   }
-   html += `<div class="m-item m-total"><div class="m-head"><span class="mc">合计</span>`
-     + `<span class="m-bar"></span><b class="m-cost">${fmtCost(totCost)}</b>`
+      + `<b class="m-cost">$${(v.cost || 0).toFixed(3)}</b>`
+      + `<span class="m-tok">${fmt(v.tokens)} · ${pct}%</span></div>`
+      + detail + `</div>`;
+  }
+  html += `<div class="m-item m-total"><div class="m-head"><span class="mc">${escapeHtml(t('panel.total'))}</span>`
+    + `<span class="m-bar"></span><b class="m-cost">$${totCost.toFixed(3)}</b>`
     + `<span class="m-tok">${fmt(totTok)}</span></div></div>`;
   bm.innerHTML = html;
 }
 
+// key (not label): resolved at render time so a language switch relabels rows.
 const STATE_META = {
-  working: { label: '干活中', cls: 'st-working' },
-  juggling: { label: '并行子任务', cls: 'st-working' },
-  sweeping: { label: '清理上下文', cls: 'st-working' },
-  thinking: { label: '思考中', cls: 'st-thinking' },
-  loafing: { label: '摸鱼中', cls: 'st-idle' },
-  waiting: { label: '等你处理', cls: 'st-waiting' },
-  needsinput: { label: '等你回复', cls: 'st-needsinput' },
-  error: { label: '出错了', cls: 'st-error' },
-  done: { label: '刚完成', cls: 'st-done' },
-  idle: { label: '空闲', cls: 'st-idle' },
-  sleeping: { label: '休息中', cls: 'st-sleeping' },
-  greet: { label: '新会话', cls: 'st-greet' },
-  talking: { label: '回应中', cls: 'st-talking' },
+  working: { key: 'state.working', cls: 'st-working' },
+  juggling: { key: 'state.juggling', cls: 'st-working' },
+  sweeping: { key: 'state.sweeping', cls: 'st-working' },
+  thinking: { key: 'state.thinking', cls: 'st-thinking' },
+  loafing: { key: 'state.loafing', cls: 'st-idle' },
+  waiting: { key: 'state.waiting', cls: 'st-waiting' },
+  needsinput: { key: 'state.needsinput', cls: 'st-needsinput' },
+  error: { key: 'state.error', cls: 'st-error' },
+  done: { key: 'state.done', cls: 'st-done' },
+  idle: { key: 'state.idle', cls: 'st-idle' },
+  sleeping: { key: 'state.sleeping', cls: 'st-sleeping' },
+  greet: { key: 'state.greet', cls: 'st-greet' },
+  talking: { key: 'state.talking', cls: 'st-talking' },
 };
-function renderChart(hourly) {
+function renderCodexUsage(usage, diag) {
+  const wrap = $('codex-usage');
+  if (!wrap) return;
+  const today = usage && usage.today;
+  const lifetime = usage && usage.lifetime;
+  if (!today || !lifetime || (!today.tokens && !lifetime.tokens)) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  wrap.classList.remove('hidden');
+  // This is an API-standard equivalent derived from local rollout tokens. A
+  // ChatGPT/Codex subscription is governed by its quota, not billed this sum.
+  $('codex-today').textContent = '$' + (today.cost || 0).toFixed(3);
+  $('codex-lifetime').textContent = '$' + (lifetime.cost || 0).toFixed(2);
+  $('codex-today-detail').textContent = fmt(today.tokens) + ' tok · ' + t('panel.codexBreakdown', {
+    in: fmt(today.input), out: fmt(today.output),
+    cached: fmt(today.cachedInput), reasoning: fmt(today.reasoningOutput),
+  });
+  const info = diag || (usage && usage.diagnostics) || {};
+  const bits = [fmt(lifetime.tokens) + ' tok', t('panel.codexLocalHistory', {
+    sessions: info.sessions || 0,
+    events: info.events || 0,
+  })];
+  if (info.estimatedModelCount) bits.push(t('panel.codexEstimated', { n: info.estimatedModelCount }));
+  $('codex-lifetime-detail').textContent = bits.join(' · ');
+}
+
+function renderDiagnostics(diag) {
+  const el = $('usage-diagnostics');
+  if (!el) return;
+  if (!diag) { el.textContent = ''; return; }
+  const last = diag.lastScanTs
+    ? new Date(diag.lastScanTs).toLocaleTimeString(LOCALE_TAG[window.OctoI18n.getLang()], { hour: '2-digit', minute: '2-digit' })
+    : t('panel.diagNever');
+  const bits = [
+    t('panel.diagScan', { when: last, files: diag.scannedFiles || 0, records: diag.records || 0 }),
+    t('panel.diagCorrections', { n: diag.streamingCorrections || 0 }),
+  ];
+  if (diag.estimatedModelCount) bits.push(t('panel.diagEstimated', { n: diag.estimatedModelCount }));
+  if (diag.pricing && diag.pricing.stale) bits.push(t('panel.diagStale'));
+  el.textContent = bits.join(' · ');
+}
+
+function renderChart(hourlyCost, hourlyTokens) {
   const el = $('chart');
   if (!el) return;
-  if (!hourly.length) hourly = new Array(24).fill(0);
-  const max = Math.max(0.000001, ...hourly);
+  const hourly = usageMetric === 'cost' ? hourlyCost : hourlyTokens;
+  const values = hourly && hourly.length ? hourly : new Array(24).fill(0);
+  const max = Math.max(0.000001, ...values);
   const nowH = new Date().getHours();
   let total = 0, peakH = 0, peakV = 0;
-  el.innerHTML = hourly
-    .map((c, h) => {
-      total += c;
-      if (c > peakV) { peakV = c; peakH = h; }
-      const pct = Math.max(3, Math.round((c / max) * 100));
-      const cls = c <= 0 ? 'bar empty' : h === nowH ? 'bar now' : 'bar';
-      return `<div class="${cls}" data-h="${h}" data-c="${c.toFixed(3)}" style="height:${c <= 0 ? 4 : pct}%" title="${h}:00 · ${fmtCost(c)}"></div>`;
+  el.innerHTML = values
+    .map((value, h) => {
+      total += value;
+      if (value > peakV) { peakV = value; peakH = h; }
+      const pct = Math.max(3, Math.round((value / max) * 100));
+      const cls = value <= 0 ? 'bar empty' : h === nowH ? 'bar now' : 'bar';
+      const display = usageMetric === 'cost' ? '$' + value.toFixed(3) : fmt(value) + ' tok';
+      return `<div class="${cls}" data-h="${h}" data-v="${escapeHtml(display)}" style="height:${value <= 0 ? 4 : pct}%" title="${h}:00 · ${escapeHtml(display)}"></div>`;
     })
     .join('');
-  hoursSummary = `今日 <b>${fmtCost(total)}</b> · 峰值 ${peakH}点 <b>${fmtCost(peakV)}</b>`;
+  hoursSummary = usageMetric === 'cost'
+    ? t('panel.hoursSummaryCost', { total: total.toFixed(2), peakH, peakV: peakV.toFixed(2) })
+    : t('panel.hoursSummaryTokens', { total: fmt(total), peakH, peakV: fmt(peakV) });
   const ro = $('hours-readout');
   if (ro) ro.innerHTML = hoursSummary;
 }
@@ -237,8 +305,9 @@ function renderCal(daily) {
   for (let d = new Date(start); d <= today; d.setDate(d.getDate() + 1)) {
     const k = dKey(d);
     const v = daily[k] || { cost: 0, tokens: 0, msgs: 0 };
-    if (v.cost > max) max = v.cost;
-    total += v.cost;
+    const metricValue = usageMetric === 'cost' ? v.cost : (v.tokens || 0);
+    if (metricValue > max) max = metricValue;
+    total += metricValue;
     list.push({ k, cost: v.cost, tokens: v.tokens || 0, msgs: v.msgs || 0 });
   }
   let html = '';
@@ -246,22 +315,34 @@ function renderCal(daily) {
     html += '<div class="cal-col">';
     for (let j = 0; j < 7 && i + j < list.length; j++) {
       const c = list[i + j];
-      const lvl = c.cost <= 0 ? 0 : Math.min(4, Math.max(1, Math.ceil((c.cost / max) * 4)));
+      const metricValue = usageMetric === 'cost' ? c.cost : c.tokens;
+      const lvl = metricValue <= 0 ? 0 : Math.min(4, Math.max(1, Math.ceil((metricValue / max) * 4)));
       const isToday = c.k === todayK ? ' today' : '';
-      html += `<div class="cal-cell lv${lvl}${isToday}" data-k="${c.k}" data-c="${c.cost.toFixed(2)}" data-t="${fmt(c.tokens)}" data-m="${c.msgs}" title="${c.k} · ${fmtCost(c.cost)}"></div>`;
+      html += `<div class="cal-cell lv${lvl}${isToday}" data-k="${c.k}" data-c="${c.cost.toFixed(2)}" data-t="${fmt(c.tokens)}" data-m="${c.msgs}" title="${c.k} · $${c.cost.toFixed(2)}"></div>`;
     }
     html += '</div>';
   }
   el.innerHTML = html;
-  calSummary = `近 ${list.length} 天合计 <b>${fmtCost(total)}</b>`;
+  calSummary = usageMetric === 'cost'
+    ? t('panel.calSummaryCost', { n: list.length, total: total.toFixed(2) })
+    : t('panel.calSummaryTokens', { n: list.length, total: fmt(total) });
   const cr = $('cal-readout');
   if (cr) cr.innerHTML = calSummary;
 }
 
+// 会话来源小图标：Claude 橙 burst / Codex 蓝终端块 / dsh 深蓝鲸波（与桌宠 HUD 同款）
+const AGENT_ICON = {
+  claude: '<svg viewBox="0 0 24 24" fill="#d97757"><path d="M12 1l2.2 6.3L20.5 5l-4 5.4 6.5 1.6-6.5 1.6 4 5.4-6.3-2.3L12 23l-2.2-6.3L3.5 19l4-5.4L1 12l6.5-1.6-4-5.4 6.3 2.3z"/></svg>',
+  codex: '<svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#3b82f6"/><path d="M7 8l4 4-4 4" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M13 16.5h4.5" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg>',
+  dsh: '<svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#4d6bfe"/><circle cx="8.6" cy="9" r="1.5" fill="#fff"/><path d="M12 9h5.4" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/><path d="M5 15c1.6 0 1.6-1.7 3.3-1.7S9.9 15 11.5 15s1.6-1.7 3.3-1.7S16.4 15 18 15" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>',
+  unknown: '<svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#777582"/><text x="12" y="17" fill="#fff" font-size="14" font-weight="700" text-anchor="middle">?</text></svg>',
+};
+const AGENT_NAME = { claude: 'Claude', codex: 'Codex', dsh: 'DeepSeek Harness', unknown: 'Agent' };
+
 function renderSessList(sessions) {
   const el = $('sess-list');
   if (!sessions.length) {
-    el.innerHTML = '<div class="empty">暂无活跃会话</div>';
+    el.innerHTML = '<div class="empty">' + escapeHtml(t('panel.noActiveSession')) + '</div>';
     return;
   }
   el.innerHTML = sessions
@@ -272,14 +353,25 @@ function renderSessList(sessions) {
         : s.state;
       const m = STATE_META[effState] || STATE_META.idle;
       const detail =
-        effState === 'waiting' ? escapeHtml(`等你${s.reason || '处理'}`)
-        : effState === 'needsinput' ? escapeHtml((s.choice && s.choice.question) || '等你回复')
+        effState === 'waiting' ? escapeHtml(s.reason ? t('wait.' + s.reason) : t('wait.default'))
+        : effState === 'needsinput' ? escapeHtml((s.choice && s.choice.question) || t('state.needsinput'))
         : (effState === 'working' || effState === 'juggling' || effState === 'sweeping' || effState === 'thinking') && s.op ? escapeHtml(s.op)
-        : escapeHtml(m.label);
-      const providerIcon = s.provider === 'codewhale' ? '🐋 ' : '';
-      return `<div class="row sess"><span class="badge ${m.cls}">${m.label}</span><span class="sess-proj">${providerIcon}${escapeHtml(s.project)}</span><span class="sess-op">${detail}</span></div>`;
+        : escapeHtml(t(m.key));
+      const icon = AGENT_ICON[s.agent] || AGENT_ICON.unknown;
+      const who = AGENT_NAME[s.agent] || 'Agent';
+      // 会话 id 芯片：短前缀够认人，点一下复制完整 id（跨 session 协作时贴给
+      // 另一个 agent 去 resume）。title 挂完整 id，不用复制也能看全。
+      const id = s.sessionId ? `<button class="sess-id" data-id="${escapeHtml(s.sessionId)}" title="${escapeHtml(s.sessionId)}&#10;${escapeHtml(t('panel.copyId'))}">${escapeHtml(shortId(s.sessionId))}</button>` : '';
+      return `<div class="row sess"><span class="badge ${m.cls}">${escapeHtml(t(m.key))}</span><span class="sess-agent" title="${who}">${icon}</span><span class="sess-proj">${escapeHtml(s.project)}</span>${id}<span class="sess-op">${detail}</span></div>`;
     })
     .join('');
+}
+
+// 会话 id 前 8 位——UUID 的前段在本机范围内已经足够唯一，完整 id 在 title 和
+// 剪贴板里。面板很窄，塞 36 个字符会把项目名和状态挤没。
+function shortId(id) {
+  const s = String(id || '');
+  return s.length > 8 ? s.slice(0, 8) : s;
 }
 
 const TODO_ICON = { completed: '✅', in_progress: '▶️', pending: '⬜️' };
@@ -292,7 +384,7 @@ function renderTodos(todos, proj) {
   const prog = $('todo-prog');
   const pj = $('todo-proj');
   if (!todos.length) {
-    el.innerHTML = '<div class="empty">当前没有待办</div>';
+    el.innerHTML = '<div class="empty">' + escapeHtml(t('panel.noTodo')) + '</div>';
     if (prog) prog.textContent = '';
     if (pj) pj.textContent = '';
     return;
@@ -309,10 +401,10 @@ function renderTodos(todos, proj) {
 }
 
 const BG_META = {
-  running: { label: '该跑', cls: 'st-working' },
-  suspect: { label: '可疑', cls: 'st-waiting' },
-  unregistered: { label: '疑似僵尸', cls: 'st-waiting' },
-  ended: { label: '已结束', cls: 'st-idle' },
+  running: { key: 'bg.running', cls: 'st-working' },
+  suspect: { key: 'bg.suspect', cls: 'st-waiting' },
+  unregistered: { key: 'bg.unregistered', cls: 'st-waiting' },
+  ended: { key: 'bg.ended', cls: 'st-idle' },
 };
 function ageStr(sec) {
   if (sec == null) return '';
@@ -329,9 +421,9 @@ function renderBg(bg) {
   const block = $('bg-block');
   if (block) block.style.display = items.length ? '' : 'none';
   const head = $('bg-head');
-  if (head) head.textContent = `后台任务 ✅${bg.running || 0} · 🧟${bg.zombie || 0}`;
+  if (head) head.textContent = t('panel.bgHead', { running: bg.running || 0, zombie: bg.zombie || 0 });
   if (!items.length) {
-    el.innerHTML = '<div class="empty">没有长跑的后台进程 — 干净</div>';
+    el.innerHTML = '<div class="empty">' + escapeHtml(t('panel.bgClean')) + '</div>';
     return;
   }
   el.innerHTML = items
@@ -339,75 +431,14 @@ function renderBg(bg) {
       const m = BG_META[it.status] || BG_META.ended;
       const ic = it.status === 'running' ? '✅' : it.status === 'ended' ? '⚪' : '🧟';
       const purpose = it.purpose ? escapeHtml(it.purpose) : escapeHtml(String(it.cmd).slice(0, 48));
-      return `<div class="row sess"><span class="badge ${m.cls}">${ic}${m.label}</span><span class="sess-proj">${purpose}</span><span class="sess-op">${ageStr(it.ageSec)} · ${it.stop ? escapeHtml(it.stop) : ''}</span></div>`;
+      return `<div class="row sess"><span class="badge ${m.cls}">${ic}${escapeHtml(t(m.key))}</span><span class="sess-proj">${purpose}</span><span class="sess-op">${ageStr(it.ageSec)} · ${it.stop ? escapeHtml(it.stop) : ''}</span></div>`;
     })
     .join('');
 }
 
 function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
+  return String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
-
-// Round 8: provider toggle UI.
-const PROVIDER_META = {
-  claude: { icon: '🐙', label: 'Claude Code' },
-  codewhale: { icon: '🐋', label: 'CodeWhale' },
-};
-
-function renderProviders() {
-  const el = $('provider-list');
-  if (!el || !config.providers) return;
-  const { active, all, cwHooksInstalled } = config.providers;
-  const activeSet = new Set(active || []);
-  const activeCount = activeSet.size;
-  el.innerHTML = (all || []).map((id) => {
-    const m = PROVIDER_META[id] || { icon: '❓', label: id };
-    const on = activeSet.has(id);
-    // W22: claude is NO LONGER locked — users can disable it to "unlock" Claude
-    // Code from the pet's permission hook. Only lock if it's the LAST active
-    // provider (must keep at least one active to show anything).
-    const locked = on && activeCount <= 1;
-    // Round 9-b: hook status indicator (only for providers that install hooks).
-    let status = '';
-    if (id === 'codewhale') {
-      if (on) {
-        // Active — show whether hooks are actually registered in config.toml.
-        const ok = !!cwHooksInstalled;
-        status = '<span class="prov-status ' + (ok ? 'ok' : 'warn') + '" title="'
-          + (ok ? 'hooks 已写入 ~/.codewhale/config.toml' : 'hooks 未注册（可能需要重启或手动安装）')
-          + '">' + (ok ? '●已注册' : '○未注册') + '</span>';
-      } else {
-        status = '<span class="prov-status off" title="provider 未启用">○未启用</span>';
-      }
-    }
-    return '<label class="prov-item' + (on ? ' active' : '') + (locked ? ' locked' : '') + '">'
-      + '<input type="checkbox" ' + (on ? 'checked' : '') + ' ' + (locked ? 'disabled' : '') + ' data-id="' + escapeHtml(id) + '">'
-      + '<span class="prov-icon">' + escapeHtml(m.icon) + '</span>'
-      + '<span class="prov-label">' + escapeHtml(m.label) + '</span>'
-      + status
-      + '</label>';
-  }).join('');
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  $('provider-list').addEventListener('change', (e) => {
-    if (!e.target.matches('input[data-id]')) return;
-    const id = e.target.dataset.id;
-    const { active } = config.providers || { active: ['claude'] };
-    const newActive = e.target.checked
-      ? [...active, id]
-      : active.filter((a) => a !== id);
-    // W22: allow disabling claude (to "unlock" it from the pet's hook). Only
-    // guard: must keep at least one active provider.
-    if (newActive.length === 0) {
-      e.target.checked = true; // revert checkbox
-      return;
-    }
-    window.pet.setProviders(newActive);
-  });
-});
 
 function applyConfigUI() {
   document.querySelectorAll('#mode-seg .seg-btn').forEach((b) =>
@@ -416,9 +447,6 @@ function applyConfigUI() {
   document.querySelectorAll('#skin-seg .seg-btn').forEach((b) =>
     b.classList.toggle('active', b.dataset.skin === (config.skin || 'mascot'))
   );
-  const bi = $('budget'); // 预算输入已移到托盘；面板里不再有该元素
-  if (bi && document.activeElement !== bi) bi.value = config.budget5h || '';
-  renderProviders();
 }
 
 // 事件
@@ -427,17 +455,33 @@ window.pet.onPrice((m) => {
   const el = $('price-src');
   if (!el || !m) return;
   if (m.live) {
-    const when = m.ts ? new Date(m.ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '缓存';
-    el.textContent = `💲 价目：在线 ${m.count} 型号 · ${when} 更新（每24h自动）`;
+    const when = m.ts ? new Date(m.ts).toLocaleString(LOCALE_TAG[window.OctoI18n.getLang()], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : t('panel.priceCache');
+    el.textContent = t('panel.priceOnline', { count: m.count, when });
   } else {
-    el.textContent = '💲 价目：内置兜底表（在线源暂不可用）';
+    el.textContent = t('panel.priceFallback');
   }
 });
 window.pet.onConfig((cfg) => {
   if (!cfg) return;
+  const langChanged = cfg.lang && cfg.lang !== window.OctoI18n.getLang();
   config = { ...config, ...cfg };
+  if (langChanged) {
+    window.OctoI18n.setLang(cfg.lang);
+    applyStaticI18n();
+    if (lastStats) render(lastStats); // relabel live rows without waiting for the next push
+  }
   applyConfigUI();
 });
+
+// Static markup ships with its Chinese text inline so the panel is never blank
+// before the first config push; data-i18n rewrites it per language.
+function applyStaticI18n() {
+  const lang = window.OctoI18n.getLang();
+  document.documentElement.lang = lang;
+  document.title = t('panel.title');
+  for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll('[data-i18n-title]')) el.title = t(el.dataset.i18nTitle);
+}
 
 $('close').addEventListener('click', () => window.pet.closePanel());
 document.querySelectorAll('#mode-seg .seg-btn').forEach((b) =>
@@ -454,14 +498,6 @@ document.querySelectorAll('#skin-seg .seg-btn').forEach((b) =>
     window.pet.setSkin(b.dataset.skin);
   })
 );
-{ // 预算输入已移到托盘；面板存在旧元素时才接线（向后兼容）
-  const bi = $('budget');
-  if (bi) bi.addEventListener('change', (e) => {
-    config.budget5h = Number(e.target.value) || 0;
-    window.pet.setBudget(config.budget5h);
-  });
-}
-
 // 视图切换：24h / 日历
 document.querySelectorAll('.view-tabs .vt').forEach((b) =>
   b.addEventListener('click', () => {
@@ -471,24 +507,53 @@ document.querySelectorAll('.view-tabs .vt').forEach((b) =>
   })
 );
 
+document.querySelectorAll('.metric-tabs .mt').forEach((b) =>
+  b.addEventListener('click', () => {
+    usageMetric = b.dataset.metric === 'cost' ? 'cost' : 'tokens';
+    document.querySelectorAll('.metric-tabs .mt').forEach((x) => x.classList.toggle('active', x === b));
+    if (lastStats) {
+      if (hasBillingLedger(lastStats)) {
+        renderChart(lastStats.hourly || [], lastStats.hourlyTok || []);
+        renderCal(lastStats.daily || {});
+      } else renderUnavailableUsage();
+    }
+  })
+);
+
 // 悬停看具体数值：24h 柱
 $('chart').addEventListener('mouseover', (e) => {
   const bar = e.target.closest('.bar');
-  if (bar) $('hours-readout').innerHTML = `${bar.dataset.h}:00 · <b>${fmtCost(Number(bar.dataset.c))}</b>`;
+  if (bar) $('hours-readout').innerHTML = `${bar.dataset.h}:00 · <b>${escapeHtml(bar.dataset.v)}</b>`;
 });
 $('chart').addEventListener('mouseleave', () => { $('hours-readout').innerHTML = hoursSummary; });
 
 // 悬停看具体数值：日历格子
 $('cal').addEventListener('mouseover', (e) => {
   const cell = e.target.closest('.cal-cell');
-  if (cell) $('cal-readout').innerHTML = `${cell.dataset.k} · <b>${fmtCost(Number(cell.dataset.c))}</b> · ${cell.dataset.t} tok · ${cell.dataset.m} 轮`;
+  if (cell) $('cal-readout').innerHTML = t('panel.calReadout', { k: cell.dataset.k, c: cell.dataset.c, t: cell.dataset.t, m: cell.dataset.m });
 });
 $('cal').addEventListener('mouseleave', () => { $('cal-readout').innerHTML = calSummary; });
+
+// 点会话 id 芯片 → 复制完整 id。委托在列表上，因为行是每次 render 重建的。
+$('sess-list').addEventListener('click', async (e) => {
+  const chip = e.target.closest && e.target.closest('.sess-id');
+  if (!chip || !window.pet.copySessionId) return;
+  const ok = await window.pet.copySessionId(chip.dataset.id);
+  if (!ok) return;
+  chip.textContent = t('panel.copied');
+  chip.classList.add('copied');
+  // 定时复原，不依赖下一次 render——面板空闲时 stats 可能好一会儿才推一次
+  setTimeout(() => {
+    chip.textContent = shortId(chip.dataset.id);
+    chip.classList.remove('copied');
+  }, 1200);
+});
 
 // 初始化
 (async () => {
   const cfg = await window.pet.getConfig();
-  if (cfg) { config = { ...config, ...cfg }; applyConfigUI(); }
+  if (cfg) { config = { ...config, ...cfg }; window.OctoI18n.setLang(cfg.lang || 'zh'); applyConfigUI(); }
+  applyStaticI18n();
   const s = await window.pet.getStats();
   if (s) render(s);
 })();

@@ -1,216 +1,147 @@
-# Release build workflow — produces cross-platform Octopus desktop pet builds.
-#
-# Triggers:
-#   - Push of a version tag matching v*.*.* (e.g. v0.1.2-pre, v0.2.0)
-#   - Manual dispatch (workflow_dispatch) with an optional tag name override
-#
-# What it does (per OS in the build matrix):
-#   1. Checks out the tagged commit (shallow, full history not needed).
-#   2. Sets up Node 22 LTS (matches the Electron 43 runtime requirement).
-#   3. Runs the full test suite as a gate (npm test) — a failing test aborts
-#      the release before any artifact is published.
-#   4. Installs build dependencies (npm ci, with electron postinstall skipped
-#      to avoid downloading the full Electron binary on the test gate; the
-#      packaging scripts download the platform-matched Electron themselves).
-#   5. Runs the per-OS packaging script (scripts/package-{linux,mac,win}.sh).
-#   6. Uploads the built artifact to the workflow run.
-#   7. A final "release" job (depends on all 3 build jobs) attaches every
-#      artifact to the GitHub Release corresponding to the tag.
-#
-# Safety:
-#   - No secrets are required. Builds are unsigned (consistent with the
-#     existing manual packaging scripts). Users who need signed builds should
-#     run the scripts locally with their own certificates.
-#   - permissions: contents: write is the ONLY scope granted — enough to
-#     upload assets to a release, not enough to push commits or modify tags.
-#   - The workflow never executes user-supplied input. The only dynamic value
-#     is the tag name, which is validated against ^v[0-9] before use.
-#   - macOS build runs on macos-latest so the native swiftc compilation of
-#     drag-window.swift (SkyLight private framework) succeeds. Linux/Windows
-#     builds run on ubuntu-latest; the Windows script downloads the win32
-#     Electron binary from the official npm mirror.
-#   - concurrency: only one release build per tag can run at a time; a new
-#     push to the same tag cancels the in-flight run.
-
 name: Release
 
 on:
   push:
     tags:
-      - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to build (must already exist, e.g. v0.1.2-pre)'
-        required: true
-        type: string
+      - "v*"
 
-# Minimum permissions. contents:write is needed to upload release assets.
-# No other scopes are granted.
 permissions:
   contents: write
 
-# One release build per tag at a time. A re-push of the same tag cancels
-# the in-flight run so we never publish two sets of artifacts for one tag.
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # ── Gate: run tests on the tagged commit before any build starts ─────────
-  test-gate:
-    name: Test gate
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      tag: ${{ steps.meta.outputs.tag }}
+  build-macos:
+    name: Build macOS ARM64
+    runs-on: macos-14
     steps:
-      - name: Checkout (tagged commit)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-          fetch-depth: 1
-
-      - name: Setup Node 22 LTS
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Resolve version + tag
-        id: meta
-        run: |
-          # Validate the tag name matches the safe pattern v<digits>.<digits>.<digits>[-suffix]
-          TAG="${GITHUB_REF##*/}"
-          if [ -z "$TAG" ] || [ "$TAG" = "${GITHUB_REF}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          fi
-          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$'; then
-            echo "::error::Invalid tag '$TAG' — must match v*.*.* (e.g. v0.1.2-pre)"
-            exit 1
-          fi
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=$TAG version=$VERSION"
-
-      - name: Run test suite (gate)
-        run: |
-          # The smoke + renderer tests use only Node built-ins and in-repo
-          # files (no electron require), so they run without npm install.
-          node test/run-all.js
-
-  # ── Build matrix: one job per OS ─────────────────────────────────────────
-  build:
-    name: Build (${{ matrix.os }})
-    needs: test-gate
-    strategy:
-      fail-fast: false  # build all OSes even if one fails, so partial releases are visible
-      matrix:
-        include:
-          - os: ubuntu-latest
-            script: package:linux
-            artifact: Octopus-linux-x64-${{ needs.test-gate.outputs.version }}.tar.gz
-            artifact_glob: dist/Octopus-linux-x64-*.tar.gz
-          - os: macos-latest
-            script: package:mac
-            artifact: Octopus-mac-arm64.zip
-            artifact_glob: dist/Octopus-mac-arm64.zip
-          - os: ubuntu-latest
-            os_label: windows
-            script: package:win
-            artifact: Octopus-win-x64-${{ needs.test-gate.outputs.version }}.zip
-            artifact_glob: dist/Octopus-win-x64-*.zip
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout (tagged commit)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-          fetch-depth: 1
-
-      - name: Setup Node 22 LTS
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install build deps (npm ci)
-        run: npm ci
-
-      - name: Download Electron platform binary (#r10-release-fix)
-        # Electron 43.x no longer runs install.js as a postinstall script.
-        # The packaging scripts (package-linux.sh / package-mac.sh) copy from
-        # node_modules/electron/dist, so we must run install.js manually to
-        # download the platform-matched Electron binary (~100-150MB).
-        # The Windows build script downloads its own win32 Electron zip, so
-        # we skip this step for the windows matrix entry.
-        if: matrix.script != 'package:win'
-        run: node node_modules/electron/install.js
+          node-version: 20
+          cache: npm
+      - name: Verify tag matches package version
+        run: node -e "const v=require('./package.json').version;if('v'+v!==process.env.GITHUB_REF_NAME)throw new Error('tag/package version mismatch')"
+      - name: Validate Apple release credentials
         env:
-          # Speed up: don't force cache
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '0'
-
-      - name: Build package (${{ matrix.script }})
-        run: npm run ${{ matrix.script }}
-
-      - name: Verify artifact exists
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          set -e
-          echo "Listing dist/ contents:"
-          ls -lh dist/ || true
-          # The glob should match exactly one file
-          ARTIFACT=$(ls ${{ matrix.artifact_glob }} 2>/dev/null | head -1 || true)
-          if [ -z "$ARTIFACT" ]; then
-            echo "::error::No artifact found matching ${{ matrix.artifact_glob }}"
-            exit 1
-          fi
-          echo "Found artifact: $ARTIFACT"
-          echo "Size: $(du -h "$ARTIFACT" | cut -f1)"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          test -n "$APPLE_DEVELOPER_ID_P12_BASE64"
+          test -n "$APPLE_DEVELOPER_ID_P12_PASSWORD"
+          node scripts/sign-notarize-mac.js --check-env
+      - name: Import Developer ID certificate
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/llmpet-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/llmpet-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -A -t agg -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application:'
+          echo "MAC_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm test
+      - name: Sign, notarize and package macOS app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run package:mac
+      - name: Verify macOS package
+        run: npm run verify:mac
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os_label || matrix.os }}-build
-          path: ${{ matrix.artifact_glob }}
+          name: llmpet-macos-arm64
+          path: dist/LLMPET-*-mac-arm64.zip
           if-no-files-found: error
-          retention-days: 14
-
-  # ── Release: attach all artifacts to the GitHub Release ──────────────────
-  release:
-    name: Attach to release
-    needs: [test-gate, build]
-    runs-on: ubuntu-latest
-    if: always() && needs.test-gate.result == 'success' && needs.build.result == 'success'
-    steps:
-      - name: Checkout (tagged commit, for release notes fallback)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-          fetch-depth: 1
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-          merge-multiple: false
-
-      - name: Flatten artifacts for upload
+      - name: Delete temporary signing keychain
+        if: always()
         run: |
-          set -e
-          mkdir -p flattened
-          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} flattened/ \;
-          echo "Artifacts to attach:"
-          ls -lh flattened/
+          if [[ -n "${MAC_SIGNING_KEYCHAIN:-}" && -f "$MAC_SIGNING_KEYCHAIN" ]]; then
+            security delete-keychain "$MAC_SIGNING_KEYCHAIN"
+          fi
 
-      - name: Attach artifacts to GitHub Release
-        uses: softprops/action-gh-release@v2
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          tag_name: ${{ needs.test-gate.outputs.tag }}
-          # Only attach files; do NOT overwrite the release notes that were
-          # manually curated (append mode is not supported by the action, so
-          # we leave body empty which preserves the existing body).
-          files: flattened/*
-          fail_on_unmatched_files: true
-          # draft: false  — publish immediately (tag push = intent to release)
-          # prerelease: auto-detected from the tag suffix (-pre, -rc, etc.)
-          draft: false
-          prerelease: ${{ contains(needs.test-gate.outputs.tag, '-pre') || contains(needs.test-gate.outputs.tag, '-rc') || contains(needs.test-gate.outputs.tag, '-beta') }}
+          node-version: 20
+          cache: npm
+      - name: Verify tag matches package version
+        run: node -e "const v=require('./package.json').version;if('v'+v!==process.env.GITHUB_REF_NAME)throw new Error('tag/package version mismatch')"
+      - run: npm ci
+      - run: npm test
+      - run: npm run package:win
+      - name: List Windows packages
+        shell: pwsh
+        run: Get-ChildItem dist -File | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmpet-windows-x64
+          path: |
+            dist/LLMPET-*-Windows-x64.exe
+            dist/LLMPET-*-Windows-x64.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Verify tag matches package version
+        run: node -e "const v=require('./package.json').version;if('v'+v!==process.env.GITHUB_REF_NAME)throw new Error('tag/package version mismatch')"
+      # The lockfile itself must only reference public npmjs tarball URLs —
+      # internal mirrors are unreachable from public runners (regression guard
+      # is also enforced by npm test via test/lockfile-hygiene.js).
+      - run: npm ci
+      - run: npm test
+      - run: npm run package:linux
+      - name: List Linux packages
+        run: ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmpet-linux-x64
+          path: |
+            dist/LLMPET-*-Linux-x64.AppImage
+            dist/LLMPET-*-Linux-x64.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LLMPET ${GITHUB_REF_NAME#v}" \
+            --generate-notes

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Register Codex Program in LLMPET"
+  short_description: "Add a verified Codex program to LLMPET Launcher"
+  default_prompt: "Use $register-generated-program to add this Codex project to LLMPET Launcher after a real launch succeeds."

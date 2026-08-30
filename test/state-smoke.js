@@ -6,6 +6,9 @@
 // Run: node test/state-smoke.js
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
 const { loadRenderer } = require('./dom-stub');
 const States = require('../shared/states');
 
@@ -21,7 +24,7 @@ const STATE_WORDS = States.RENDER_STATE_WORDS;
 
 function baseStats(over = {}) {
   return {
-    today: { cost: 0 }, window5h: { cost: 0 }, sessions: [], bg: { zombie: 0 },
+    today: { cost: 0 }, lifetime: { cost: 0 }, sessions: [], bg: { zombie: 0 },
     waitingCount: 0, needsinputCount: 0, workingCount: 0, jugglingCount: 0,
     sweepingCount: 0, thinkingCount: 0, loafingCount: 0, errorCount: 0, idleMs: 1000,
     ...over,
@@ -29,7 +32,7 @@ function baseStats(over = {}) {
 }
 
 function world() {
-  const w = loadRenderer(['shared/states.js', 'renderer/pet.js']);
+  const w = loadRenderer(['shared/i18n.js', 'shared/states.js', 'renderer/pet.js']);
   w.handlers.config({ skin: 'cat', muted: true }); // muted: 免声音路径干扰
   return w;
 }
@@ -38,6 +41,89 @@ const catSrc = (w) => w.elements('cat-img').getAttribute('src');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  console.log('[R-1] 桌宠会话板 Session ID');
+  {
+    const w = world();
+    const fullId = '019fc6b1-fd00-7a21-9c33-2b7e51aa1f04';
+    const row = vm.runInContext(`(() => {
+      const row = createSessRow();
+      updateSessRow(row, {
+        project: 'copy-session-test', agent: 'codex', state: 'idle',
+        sessionId: '${fullId}', badge: null,
+      });
+      return row;
+    })()`, w.sandbox);
+    check('会话行恢复 Session ID', () => assert.strictEqual(row._parts.sessionId.textContent, 'ID 019fc6b1…1f04 ⧉'));
+    check('悬停可看到完整 Session ID', () => assert(row._parts.sessionId.title.startsWith(fullId)));
+    row._parts.sessionId.dispatch('click');
+    await sleep(0);
+    check('点击复制的是完整 Session ID', () => assert(w.calls.some((c) => c[0] === 'copySessionId' && c[1][0] === fullId)));
+    check('复制成功有即时反馈', () => assert(row._parts.sessionId.classList.contains('copied')));
+  }
+
+  console.log('[R-1b] provider capability 与 DSH 计费边界');
+  {
+    const w = world();
+    const row = vm.runInContext('createSessRow()', w.sandbox);
+    const update = (agent) => vm.runInContext(
+      `updateSessRow(__row, { project: 'capability-test', agent: '${agent}', state: 'idle', sessionId: 'cap-${agent}', badge: null })`,
+      Object.assign(w.sandbox, { __row: row }),
+    );
+    const hidden = (action) => row._parts[action].classList.contains('hidden');
+
+    update('claude');
+    check('Claude 显示接管/表情包/旅行', () => assert.deepStrictEqual(
+      ['takeover', 'meme', 'travel'].map(hidden), [false, false, false],
+    ));
+    update('dsh');
+    check('DSH 只保留作为来源的接管入口', () => assert.deepStrictEqual(
+      ['takeover', 'meme', 'travel'].map(hidden), [false, true, true],
+    ));
+    update('unknown');
+    check('unknown 三个动作全部 fail-closed', () => assert.deepStrictEqual(
+      ['takeover', 'meme', 'travel'].map(hidden), [true, true, true],
+    ));
+    const blockedTakeover = vm.runInContext("openTakeoverPage({ agent: 'unknown' })", w.sandbox);
+    const blockedMeme = await vm.runInContext("openMemePage({ agent: 'unknown' })", w.sandbox);
+    const blockedTravel = await vm.runInContext("openTravelPage({ agent: 'unknown' })", w.sandbox);
+    check('unknown 无法绕过隐藏状态直接打开动作页', () => assert.deepStrictEqual(
+      [blockedTakeover, blockedMeme, blockedTravel], [false, false, false],
+    ));
+    vm.runInContext("takeoverTarget = { agent: 'unknown', sessionId: 'unknown-takeover' }", w.sandbox);
+    const blockedTakeoverRun = await vm.runInContext("runTakeover('claude')", w.sandbox);
+    vm.runInContext("travelTarget = { agent: 'unknown', sessionId: 'unknown-travel' }", w.sandbox);
+    w.elements('sl-travel-mission').value = 'must not run';
+    await w.elements('sl-travel-start')._listeners.click[0]({ stopPropagation() {} });
+    check('unknown 即使污染内部 target 也不能触发 takeover/travel IPC', () => {
+      assert.strictEqual(blockedTakeoverRun, false);
+      assert.strictEqual(w.calls.some((call) => call[0] === 'takeOverSession'), false);
+      assert.strictEqual(w.calls.some((call) => call[0] === 'startTravel'), false);
+    });
+    update('codex');
+    check('row 复用回 Codex 后三个入口恢复，hidden 不残留', () => assert.deepStrictEqual(
+      ['takeover', 'meme', 'travel'].map(hidden), [false, false, false],
+    ));
+
+    const dsh = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'renderer/pet.js'],
+      { search: '?agent=dsh' },
+    );
+    dsh.handlers.config({ skin: 'pixel', muted: true });
+    dsh.handlers.stats(baseStats({
+      billingAvailable: false,
+      today: { cost: 123.456 },
+      lifetime: { cost: 999.999 },
+      codexUsage: { today: { cost: 88, tokens: 12345 } },
+    }));
+    check('DSH 独立宠只显示身份，不显示任何 Claude/Codex 美元值', () => {
+      assert.strictEqual(dsh.elements('chip-cost').textContent, 'DeepSeek Harness');
+      assert(dsh.elements('chip-sep').classList.contains('hidden'));
+      assert(dsh.elements('chip-window').classList.contains('hidden'));
+      assert(!dsh.elements('chip-cost').textContent.includes('$'));
+      assert(!dsh.elements('chip-window').textContent.includes('$'));
+    });
+  }
+
   console.log('[R0] 状态词表单一来源一致性');
   {
     // 后端 VALID_STATES（core 接受的状态）必须全部落在渲染端 STATE_WORDS 里，
@@ -49,6 +135,344 @@ async function main() {
       const oi = world().window.OctoStates;
       assert(oi && Array.isArray(oi.RENDER_STATE_WORDS));
       assert.deepStrictEqual(oi.RENDER_STATE_WORDS, States.RENDER_STATE_WORDS);
+    });
+    check('cat/whale 每个可见表情状态都有真实 GIF', () => {
+      const w = world();
+      const packs = vm.runInContext('({ cat: { states: CAT_STATES, pools: CAT_POOLS }, whale: { states: WHALE_STATES, pools: WHALE_POOLS } })', w.sandbox);
+      const required = [
+        'idle', 'roam', 'working', 'thinking', 'talking', 'juggling', 'sweeping',
+        'waiting', 'needsinput', 'happy', 'greet', 'attention', 'sleeping', 'error',
+        'loafing', 'loved', 'excited', 'sad', 'sorry', 'puzzled', 'lookout',
+      ];
+      for (const [skin, pack] of Object.entries(packs)) {
+        assert.deepStrictEqual(required.filter((state) => !pack.states[state]), [], `${skin} missing state mapping`);
+        const files = [...Object.values(pack.states), ...Object.values(pack.pools).flat()];
+        for (const file of new Set(files)) {
+          const fp = path.join(__dirname, '..', 'assets', skin, file);
+          assert(fs.existsSync(fp), `${skin} missing ${file}`);
+          assert(fs.statSync(fp).size > 0, `${skin} empty ${file}`);
+          assert.strictEqual(fs.readFileSync(fp).subarray(0, 3).toString('ascii'), 'GIF', `${skin} invalid ${file}`);
+        }
+      }
+    });
+  }
+
+  console.log('[R0a] cat / whale 外围装饰边界');
+  {
+    const w = world();
+    const stage = w.elements('stage');
+    const stageChildrenBefore = stage.children.length;
+    vm.runInContext("playAction('Bash', '⚙️'); playAction('Task', '🐙'); confetti();", w.sandbox);
+    check('cat 只去掉工具道具，保留分身与彩带', () => {
+      assert.strictEqual(w.elements('prop').textContent, '');
+      assert(!w.elements('prop').classList.contains('on'));
+      assert(w.elements('sidekick').classList.contains('on'));
+      assert.strictEqual(stage.children.length, stageChildrenBefore + 12);
+    });
+
+    w.handlers.config({ skin: 'whale', muted: true });
+    vm.runInContext("playAction('Bash', '⚙️'); playAction('Task', '🐙'); confetti();", w.sandbox);
+    check('whale 同样只去掉工具道具', () => {
+      assert.strictEqual(w.elements('prop').textContent, '');
+      assert(!w.elements('prop').classList.contains('on'));
+      assert(w.elements('sidekick').classList.contains('on'));
+      assert.strictEqual(stage.children.length, stageChildrenBefore + 24);
+    });
+
+    vm.runInContext("showBubble('⚙️ 运行命令', 3200, true)", w.sandbox);
+    check('对话框内容与其中的 emoji 保留', () => {
+      assert.strictEqual(w.elements('bubble-text').textContent, '⚙️ 运行命令');
+      assert(!w.elements('bubble').classList.contains('hidden'));
+    });
+
+    w.handlers.config({ skin: 'mascot', muted: true });
+    vm.runInContext("playAction('Bash', '⚙️'); playAction('Task', '🐙'); confetti();", w.sandbox);
+    check('mascot 原有外围反馈不受影响', () => {
+      assert.strictEqual(w.elements('prop').textContent, '🐙');
+      assert(w.elements('prop').classList.contains('on'));
+      assert(w.elements('sidekick').classList.contains('on'));
+      assert.strictEqual(stage.children.length, stageChildrenBefore + 36);
+    });
+  }
+
+  console.log('[R0b] whale 错误态红色彩带');
+  {
+    const w = world();
+    const pet = w.elements('cat');
+    const ribbons = () => pet.children.filter((el) => el.classList.contains('error-ribbon'));
+
+    w.handlers.config({ skin: 'whale', muted: true });
+    w.handlers.stats(baseStats({ errorCount: 1 }));
+    check('whale 进入错误态会生成红色彩带层', () => {
+      assert.strictEqual(w.elements('cat').classList.contains('error'), true);
+      assert.strictEqual(ribbons().length, 14);
+      assert(ribbons().every((el) => el.textContent === ''));
+    });
+
+    w.handlers.config({ skin: 'cat', muted: true });
+    check('同一错误态切换为 cat 会立即清掉彩带', () => assert.strictEqual(ribbons().length, 0));
+
+    w.handlers.config({ skin: 'whale', muted: true });
+    check('切回 whale 错误态会恢复彩带', () => assert.strictEqual(ribbons().length, 14));
+    w.handlers.stats(baseStats());
+    check('whale 离开错误态会立即清掉彩带', () => assert.strictEqual(ribbons().length, 0));
+  }
+
+  console.log('[R0.1] 透明窗拖拽失败路径');
+  {
+    const w = world();
+    w.handlers.config({ skin: 'mascot', muted: true });
+    const mascot = w.elements('mascot');
+    mascot.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 41, screenX: 100, screenY: 100,
+    });
+    await sleep(0);
+    mascot.dispatch('pointermove', {
+      buttons: 0, pointerId: 41, screenX: 145, screenY: 145,
+    });
+    check('漏掉 pointerup 后的纯 hover 不再移动窗口', () => {
+      assert(!w.calls.some((c) => c[0] === 'setWinPos'));
+      assert(!mascot.classList.contains('dragging'));
+    });
+
+    mascot.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 42, screenX: 200, screenY: 200,
+    });
+    await sleep(0);
+    mascot.dispatch('lostpointercapture', { pointerId: 42 });
+    mascot.dispatch('pointermove', {
+      buttons: 1, pointerId: 42, screenX: 250, screenY: 250,
+    });
+    check('pointer capture 丢失后不会继续拖动', () => {
+      assert(!w.calls.some((c) => c[0] === 'setWinPos'));
+      assert(!mascot.classList.contains('dragging'));
+    });
+  }
+
+  {
+    const w = world();
+    const cat = w.elements('cat');
+    const pendingOrigins = [];
+    w.window.pet.getWinPos = () => new Promise((resolve) => pendingOrigins.push(resolve));
+
+    cat.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 51, screenX: 10, screenY: 10,
+    });
+    cat.dispatch('pointerup', { pointerId: 51 });
+    cat.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 52, screenX: 100, screenY: 100,
+    });
+    pendingOrigins[0]([900, 700]);
+    await sleep(0);
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 52, screenX: 130, screenY: 130,
+    });
+    check('旧手势的异步窗口坐标不会污染新手势', () => {
+      assert(!w.calls.some((c) => c[0] === 'setWinPos'));
+    });
+    pendingOrigins[1]([20, 30]);
+    await sleep(0);
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 52, screenX: 135, screenY: 135,
+    });
+    check('新手势自己的窗口坐标到达后仍可正常拖动', () => {
+      assert(w.calls.some((c) => c[0] === 'setWinPos'));
+    });
+    cat.dispatch('pointercancel', { pointerId: 52 });
+  }
+
+  {
+    const w = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'shared/pet-geometry.js', 'renderer/pet.js'],
+      { window: { screenX: 300, screenY: 200 } },
+    );
+    w.handlers.config({ skin: 'cat', muted: true });
+    const cat = w.elements('cat');
+    let resolveOrigin;
+    w.window.pet.getWinPos = () => new Promise((resolve) => { resolveOrigin = resolve; });
+
+    cat.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 53, screenX: 100, screenY: 100,
+    });
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 53, screenX: 125, screenY: 120,
+    });
+    check('首个 pointermove 不等待异步窗口坐标，直接连续移动', () => {
+      assert(w.calls.some((c) => c[0] === 'setWinPos'
+        && c[1][0] === 325 && c[1][1] === 220));
+    });
+
+    resolveOrigin([900, 700]);
+    await sleep(0);
+    w.calls.length = 0;
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 53, screenX: 130, screenY: 125,
+    });
+    check('迟到的 IPC 坐标不会让已开始的拖动突然跳位', () => {
+      assert(w.calls.some((c) => c[0] === 'setWinPos'
+        && c[1][0] === 330 && c[1][1] === 225));
+    });
+    cat.dispatch('pointerup', { pointerId: 53 });
+  }
+
+  {
+    const w = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'shared/pet-geometry.js', 'renderer/pet.js'],
+      { window: { screenX: 300, screenY: 200 } },
+    );
+    w.handlers.config({ skin: 'cat', muted: true });
+    const cat = w.elements('cat');
+    cat.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 54, screenX: 100, screenY: 100,
+    });
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 54, screenX: 125, screenY: 120,
+    });
+    cat.dispatch('pointerup', { pointerId: 54, screenX: 125, screenY: 120 });
+    const traceEntries = w.calls
+      .filter((c) => c[0] === 'petDragTrace')
+      .map((c) => c[1][0]);
+    const pointerdown = traceEntries.find((entry) => entry.event === 'pointerdown');
+    const request = traceEntries.find((entry) => entry.event === 'position-request');
+    const ended = traceEntries.find((entry) => entry.event === 'gesture-end');
+    check('一次拖动可用同一 dragId 串起触发、位置请求和结束原因', () => {
+      assert(pointerdown && pointerdown.dragId);
+      assert.strictEqual(request && request.dragId, pointerdown.dragId);
+      assert.strictEqual(ended && ended.dragId, pointerdown.dragId);
+      assert.strictEqual(ended.reason, 'pointerup');
+      assert(w.calls.some((c) => c[0] === 'setWinPos'
+        && c[1][2] && c[1][2].dragId === pointerdown.dragId));
+    });
+  }
+
+  {
+    const w = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'shared/pet-geometry.js', 'renderer/pet.js'],
+      { window: { screenX: 300, screenY: 200 } },
+    );
+    w.handlers.config({ skin: 'cat', muted: true });
+    const cat = w.elements('cat');
+    cat.dispatch('pointerdown', {
+      button: 0, buttons: 1, pointerId: 55, screenX: 100, screenY: 100,
+    });
+    w.dispatchWindow('mousemove', { buttons: 0, clientX: 140, clientY: 140 });
+    cat.dispatch('pointermove', {
+      buttons: 1, pointerId: 55, screenX: 125, screenY: 120,
+    });
+    check('透明窗同帧转发的 window mousemove(buttons=0) 不会抢先取消拖动', () => {
+      assert(w.calls.some((c) => c[0] === 'setWinPos'));
+      assert(w.calls.some((c) => c[0] === 'petDragTrace'
+        && c[1][0].event === 'window-mousemove-buttons-zero'));
+    });
+    cat.dispatch('pointerup', { pointerId: 55 });
+  }
+
+  console.log('[R0.2] 权限卡到确认气泡的尺寸交接');
+  {
+    const w = world();
+    w.handlers.config({ skin: 'mascot', muted: false });
+    const choice = {
+      kind: 'perm', sessionId: 'permission-resize', permId: 'perm-resize',
+      project: 'LLMPET', question: '允许执行命令吗？',
+      options: [
+        { label: '允许', key: 'allow' },
+        { label: '拒绝', key: 'deny' },
+      ],
+    };
+    w.handlers.stats(baseStats({
+      waitingCount: 1,
+      sessions: [{
+        sessionId: choice.sessionId, project: choice.project, agent: 'claude',
+        state: 'waiting', choice,
+      }],
+    }));
+    await sleep(20);
+    const callsBeforeAllow = w.calls.length;
+    w.elements('ask-opts').children[0].dispatch('click');
+    await sleep(20);
+    const transitionSizes = w.calls.slice(callsBeforeAllow)
+      .filter((c) => c[0] === 'setPetSize')
+      .map((c) => c[1].slice(0, 2));
+    check('点击允许不会先收成基础窗再展开确认气泡', () => {
+      assert(!transitionSizes.some(([width, height]) => width === 0 && height === 0),
+        'unexpected intermediate collapse: ' + JSON.stringify(transitionSizes));
+      assert(w.calls.slice(callsBeforeAllow).some((c) => c[0] === 'decidePermission'));
+      assert(!w.elements('bubble').classList.contains('hidden'));
+    });
+  }
+
+  console.log('[R0.3] 弹层关闭必须修复真实窗口尺寸');
+  {
+    const catRect = { left: 100, top: 160, right: 220, bottom: 280, width: 120, height: 120 };
+    const w = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'shared/pet-geometry.js', 'renderer/pet.js'],
+      {
+        window: {
+          screenX: 996,
+          screenY: 230,
+          innerWidth: 320,
+          innerHeight: 340,
+          screen: { availLeft: 0, availTop: 0, availWidth: 1440, availHeight: 900 },
+        },
+        elementRects: { cat: catRect },
+      },
+    );
+    w.handlers.config({ skin: 'cat', muted: true });
+    await sleep(20);
+
+    // Send one ordinary reset while the real frame is resting. A later reset
+    // must still reach the main process even though its payload is identical.
+    vm.runInContext('setRequestedPetSize(0, 0)', w.sandbox);
+    w.calls.length = 0;
+
+    // A popup has widened the real BrowserWindow, but the visible cat is still
+    // on the same screen pixel. Signature-only dedupe used to swallow this
+    // second reset and leave 520/760px frames behind.
+    w.window.screenX = 896;
+    w.window.innerWidth = 520;
+    catRect.left = 200;
+    catRect.right = 320;
+    const repaired = vm.runInContext('setRequestedPetSize(0, 0)', w.sandbox);
+    check('前一次相同 reset 不能吞掉仍为 520px 的真实窗口修复', () => {
+      assert.strictEqual(repaired, true);
+      assert(w.calls.some((c) => c[0] === 'setPetSize'
+        && c[1][0] === 0 && c[1][1] === 0));
+    });
+  }
+
+  console.log('[R0.4] 拖动收尾不重复提交已稳定窗口');
+  {
+    const w = loadRenderer(
+      ['shared/i18n.js', 'shared/states.js', 'shared/pet-geometry.js', 'renderer/pet.js'],
+      {
+        window: {
+          screenX: 600,
+          screenY: 300,
+          innerWidth: 320,
+          innerHeight: 340,
+          screen: { availLeft: 0, availTop: 0, availWidth: 1440, availHeight: 900 },
+        },
+        elementRects: {
+          cat: { left: 100, top: 160, right: 220, bottom: 280, width: 120, height: 120 },
+        },
+      },
+    );
+    w.handlers.config({ skin: 'cat', muted: true });
+    await sleep(20);
+    w.calls.length = 0;
+
+    const skipped = vm.runInContext('setRequestedPetSize(0, 0, { settle: true })', w.sandbox);
+    check('基础窗已经稳定时，拖动结束不再触发一次 setBounds', () => {
+      assert.strictEqual(skipped, false);
+      assert(!w.calls.some((c) => c[0] === 'setPetSize'));
+    });
+
+    w.window.innerWidth = 520;
+    const repaired = vm.runInContext('setRequestedPetSize(0, 0, { settle: true })', w.sandbox);
+    check('拖动结束遇到残留大窗口时仍会修复', () => {
+      assert.strictEqual(repaired, true);
+      assert(w.calls.some((c) => c[0] === 'setPetSize'
+        && c[1][0] === 0 && c[1][1] === 0));
     });
   }
 
@@ -84,6 +508,14 @@ async function main() {
     w.handlers.stats(baseStats({ workingCount: 2 }));
     check('transient 到期后回落 working', () => assert(cat.classList.contains('working')));
   }
+  {
+    const w = world();
+    const cat = w.elements('cat');
+    w.handlers.event({ kind: 'greet', project: 'new-session' });
+    check('SessionStart greet 进入上线表情', () => assert(cat.classList.contains('greet')));
+    w.handlers.event({ kind: 'user-turn', project: 'new-session' });
+    check('紧随的新任务事件不会秒盖 greet', () => assert(cat.classList.contains('greet')));
+  }
 
   console.log('[R3] operation 事件的守卫');
   {
@@ -92,7 +524,9 @@ async function main() {
     w.handlers.stats(baseStats({ workingCount: 1 }));
     w.handlers.event({ kind: 'user-turn', project: 'p' });
     w.handlers.event({ kind: 'operation', tool: 'Bash', icon: '⚙️', detail: '运行命令' });
-    check('transient 存续期 operation 不盖 thinking', () => assert(cat.classList.contains('thinking')));
+    check('首个 operation 立即结束 thinking 过渡态并进入 working', () => assert(cat.classList.contains('working')));
+    w.handlers.stats(baseStats({ workingCount: 1 }));
+    check('后续快照不让已清理的 thinking 复活', () => assert(cat.classList.contains('working')));
     // needsinput 稳态不被 op 降级
     const w2 = world();
     const cat2 = w2.elements('cat');
@@ -106,6 +540,15 @@ async function main() {
     w3.handlers.stats(baseStats({ errorCount: 1, workingCount: 1 }));
     w3.handlers.event({ kind: 'operation', tool: 'Read', icon: '📖', detail: '读取文件' });
     check('error 稳态不被 operation 打断', () => assert(cat3.classList.contains('error')));
+    // 子 agent 动作不能被 operation 分支强制折叠成 working。
+    const w4 = world();
+    const cat4 = w4.elements('cat');
+    w4.handlers.event({
+      kind: 'operation', tool: 'Task', icon: '🤹', detail: '启动子任务', visualState: 'juggling',
+    });
+    check('子 agent operation 显示 juggling 类', () => assert(cat4.classList.contains('juggling')));
+    check('子 agent operation 真实选中 cat-juggling.gif', () =>
+      assert(catSrc(w4).endsWith('cat-juggling.gif')));
   }
 
   console.log('[R4] happy 庆祝不被同批 say 秒盖，say 接棒');
@@ -119,6 +562,82 @@ async function main() {
     check('同批 say 不秒盖 happy', () => assert(cat.classList.contains('happy')));
     await sleep(2000); // happy 1800ms 结束后 say 接棒
     check('happy 结束后 talking 接棒', () => assert(cat.classList.contains('talking')));
+  }
+
+  console.log('[R4b] ending 常驻、按会话折叠与逐会话确认');
+  {
+    const w = world();
+    w.handlers.config({ skin: 'cat', muted: false });
+    const bubble = w.elements('bubble');
+    const first = {
+      kind: 'say', sessionId: 'ending-session-a', project: 'alpha', agent: 'codex',
+      text: '第一段完成信息会保留在桌宠上。',
+    };
+    const second = {
+      kind: 'say', sessionId: 'ending-session-b', project: 'alpha', agent: 'codex',
+      text: '第二段完成信息作为最新摘要显示。',
+    };
+    w.handlers.event(first);
+    vm.runInContext('hideBubble()', w.sandbox);
+    check('单条 ending 不受旧自动隐藏路径影响', () => {
+      assert(!bubble.classList.contains('hidden'));
+      assert(bubble.classList.contains('ending'));
+      assert(w.elements('bubble-text').textContent.includes('第一段完成信息'));
+    });
+
+    w.handlers.event(second);
+    check('两个同项目也按 sessionId 算作两个对话并默认折叠', () => {
+      assert(bubble.classList.contains('collapsed'));
+      assert.strictEqual(w.elements('bubble-count').textContent, '2 个对话');
+      assert(w.elements('bubble-text').textContent.includes('第二段完成信息'));
+      assert(!w.elements('bubble-toggle').classList.contains('hidden'));
+    });
+
+    w.handlers.event({ kind: 'operation', sessionId: 'work-c', tool: 'Read', icon: '📖', detail: '读取文件' });
+    check('普通状态可临时覆盖 ending', () => assert(!bubble.classList.contains('ending')));
+    vm.runInContext('hideBubble()', w.sandbox);
+    check('普通状态结束后恢复常驻 ending', () => {
+      assert(bubble.classList.contains('ending'));
+      assert.strictEqual(w.elements('bubble-count').textContent, '2 个对话');
+    });
+
+    w.elements('bubble-toggle').dispatch('click');
+    check('点击计数可展开其余完成信息', () => {
+      assert(bubble.classList.contains('expanded'));
+      assert.strictEqual(w.elements('bubble-toggle').getAttribute('aria-expanded'), 'true');
+      assert.strictEqual(w.elements('bubble-stack').children.length, 1);
+      assert(w.elements('bubble-stack').children[0].children[1].textContent.includes('第一段完成信息'));
+    });
+
+    w.handlers.event({ kind: 'user-turn', sessionId: second.sessionId, project: second.project, agent: 'codex' });
+    vm.runInContext('hideBubble()', w.sandbox);
+    check('新一轮的短提示结束后，其他对话的 ending 继续常驻', () => {
+      assert(bubble.classList.contains('ending'));
+      assert(w.elements('bubble-text').textContent.includes('第一段完成信息'));
+      assert(w.elements('bubble-toggle').classList.contains('hidden'));
+    });
+
+    w.elements('bubble-dismiss').dispatch('click');
+    check('用户可主动关闭全部完成信息', () => assert(bubble.classList.contains('hidden')));
+  }
+  {
+    const w = world();
+    const bubble = w.elements('bubble');
+    w.handlers.stats(baseStats({ waitingCount: 1 }));
+    vm.runInContext('hideBubble(true)', w.sandbox);
+    w.handlers.event({
+      kind: 'say', sessionId: 'ending-while-waiting', project: 'parallel', agent: 'codex',
+      text: '另一个并行对话已完成。',
+    });
+    check('等待用户操作时 ending 入箱但不覆盖 waiting', () => {
+      assert.strictEqual(vm.runInContext('endingMessages.size', w.sandbox), 1);
+      assert(bubble.classList.contains('hidden'));
+    });
+    w.handlers.stats(baseStats({ waitingCount: 0 }));
+    check('waiting 解除后自动恢复期间收到的 ending', () => {
+      assert(bubble.classList.contains('ending'));
+      assert(w.elements('bubble-text').textContent.includes('另一个并行对话已完成'));
+    });
   }
 
   console.log('[R5] needsinput / waiting 清残留 transient');
@@ -183,7 +702,7 @@ async function main() {
 
   console.log('[R9] 启动不闪 idle');
   {
-    const w = loadRenderer(['renderer/pet.js']);
+    const w = loadRenderer(['shared/i18n.js', 'renderer/pet.js']);
     w.handlers.config({ skin: 'cat', muted: true });
     // 模拟 init 拿到快照（getStats stub 返回 null，这里直接补推快照 + 确认不被覆盖）
     w.handlers.stats(baseStats({ workingCount: 1 }));
@@ -217,6 +736,283 @@ async function main() {
     check('thinking > loafing', () => assert(w.elements('cat').classList.contains('thinking')));
     w.handlers.stats(baseStats({ loafingCount: 1, workingCount: 1 }));
     check('working > loafing', () => assert(w.elements('cat').classList.contains('working')));
+  }
+
+  console.log('[R11] 青蛙旅行视觉层');
+  {
+    const w = world();
+    const activeTravel = {
+      active: {
+        id: 'trip-1', agent: 'claude', project: 'p', mission: '只读侦察',
+        status: 'traveling', startedAt: Date.now(),
+      },
+      latest: null,
+      growth: { totalTokens: 0, completed: 0, rank: {} },
+      templates: [],
+    };
+    w.handlers.stats(baseStats({ workingCount: 2, travel: activeTravel }));
+    check('旅行中覆盖普通 working，显示 roam 素材', () => {
+      assert(w.elements('cat').classList.contains('roam'));
+      assert(catSrc(w).endsWith('cat-roam.gif'));
+    });
+    w.handlers.stats(baseStats({ needsinputCount: 1, workingCount: 2, travel: activeTravel }));
+    check('待用户回复仍高于旅行视觉', () => assert(w.elements('cat').classList.contains('needsinput')));
+    w.handlers.travel({
+      type: 'completed',
+      trip: { id: 'trip-1', agent: 'claude', result: 'postcard', usage: { tokens: 10000 } },
+      state: { active: null, latest: null, growth: { totalTokens: 10000, completed: 1, rank: { leaf: 1 } }, templates: [] },
+    });
+    check('旅行归来进入 happy 庆祝', () => assert(w.elements('cat').classList.contains('happy')));
+  }
+
+  console.log('[R10b] 鲸鱼女仆皮肤状态与领地动画');
+  {
+    const w = world();
+    w.handlers.config({ skin: 'whale', muted: true });
+    w.handlers.stats(baseStats({ workingCount: 1 }));
+    check('whale working 使用鲸鱼素材', () => {
+      assert(catSrc(w).endsWith('/whale/whale-working.gif'));
+    });
+    w.handlers.event({ kind: 'loot', phase: 'kick', direction: -1 });
+    check('whale 出脚重播不会串回月薪喵素材', () => {
+      // roam 从占位(借 idle 图)改为专属奔跑素材后，出脚重播应命中 whale-roam。
+      assert(/\/whale\/whale-roam\.gif\?loot-kick=\d+$/.test(catSrc(w)));
+      assert(!catSrc(w).includes('/cat/'));
+    });
+  }
+
+  console.log('[R12] 旅行授权使用稳定的来信卡片');
+  {
+    const w = world();
+    w.handlers.stats(baseStats({
+      waitingCount: 1,
+      sessions: [{
+        sessionId: 'travel-mailbox',
+        agent: 'claude',
+        state: 'waiting',
+        reason: 'perm',
+        headless: false,
+        sessionRole: 'travel',
+        choice: {
+          kind: 'perm',
+          sessionId: 'travel-mailbox',
+          permId: 'travel-perm',
+          project: 'Claude 旅行信箱',
+          header: 'Claude 猫猫在路上',
+          question: '它想继续赶路，需要：联网搜索',
+          options: [
+            { label: '这次放行', key: 'allow' },
+            { label: '以后旅行联网都放行', key: 'travel:always-web' },
+            { label: '不去了', key: 'deny' },
+          ],
+          travel: true,
+        },
+      }],
+    }));
+    check('旅行来信保持在 ask 面板而不是闪退', () => {
+      assert(!w.elements('ask').classList.contains('hidden'));
+      assert(w.elements('ask').classList.contains('travel-letter'));
+      assert.strictEqual(w.elements('ask-label').textContent, '✉️ 旅行来信');
+    });
+    check('旅行来信提供专属终端入口', () => {
+      assert.strictEqual(w.elements('ask-term').textContent, '💬 去旅行终端看看');
+    });
+
+    const w2 = world();
+    w2.handlers.stats(baseStats({
+      sessions: [{ sessionId: 'ordinary', agent: 'codex', project: '普通任务', state: 'idle', headless: false }],
+    }));
+    const pet = w2.elements('cat');
+    pet.dispatch('pointerdown', { button: 0, pointerId: 1, screenX: 0, screenY: 0 });
+    pet.dispatch('pointerup', { pointerId: 1 });
+    w2.handlers.stats(baseStats({
+      waitingCount: 1,
+      sessions: [{
+        sessionId: 'background-choice',
+        agent: 'codex',
+        project: '后台任务',
+        state: 'waiting',
+        headless: false,
+        choice: {
+          kind: 'continue',
+          sessionId: 'background-choice',
+          project: '后台任务',
+          question: '继续吗？',
+          options: [{ label: '继续', key: 'continue' }],
+        },
+      }],
+    }));
+    check('后台授权快照不会闪关用户打开的会话面板', () => {
+      assert(!w2.elements('sesslist').classList.contains('hidden'));
+      assert(w2.elements('ask').classList.contains('hidden'));
+    });
+  }
+
+  console.log('[R13] 旅行会话独立列表 + 字符画明信片');
+  {
+    const w = world();
+    w.window.pet.getTravel = () => Promise.resolve({
+      active: null,
+      latest: null,
+      growth: { totalTokens: 12000, completed: 1, rank: { units: 1, leaf: 1 } },
+      templates: [],
+    });
+    w.window.pet.getTravelPostcards = () => Promise.resolve([{
+      id: 'postcard-1',
+      agent: 'codex',
+      project: '地球怪角落',
+      status: 'completed',
+      result: [
+        '这趟我去了四个完全不同的地方。',
+        '',
+        '第一站｜珠穆朗玛峰',
+        '我沿着雪线走到很高的山脊，看见了很小的营地。',
+        '',
+        '第二站｜纳米布沙漠',
+        '我在沙丘之间找到了会出生也会消失的仙女圈。',
+        '',
+        '可第三站一挖到地下，是白蚁巢。',
+        '',
+        '偏偏一条线索又把我带去了第四站——澳大利亚皮尔巴拉。',
+      ].join('\n'),
+      usage: { tokens: 12000 },
+    }]);
+    w.handlers.stats(baseStats({
+      machineGrowth: {
+        totalTokens: 8970000000,
+        claudeTokens: 6980000000,
+        codexTokens: 1990000000,
+        rank: {
+          unitTokens: 10000000,
+          units: 897,
+          crown: 3,
+          sun: 2,
+          moon: 0,
+          star: 0,
+          leaf: 1,
+          progressTokens: 0,
+          nextTokens: 10000000,
+        },
+      },
+      sessions: [
+        { sessionId: 'ordinary', agent: 'claude', project: '普通任务', state: 'idle', headless: false },
+        {
+          sessionId: 'travel-mailbox',
+          agent: 'codex',
+          travelAgent: 'codex',
+          project: 'Codex 旅行信箱',
+          state: 'idle',
+          headless: false,
+          sessionRole: 'travel',
+        },
+      ],
+    }));
+    const cat = w.elements('cat');
+    cat.dispatch('pointerdown', { button: 0, pointerId: 1, screenX: 0, screenY: 0 });
+    cat.dispatch('pointerup', { pointerId: 1 });
+    check('普通任务列表不再混入旅行会话', () => {
+      assert.strictEqual(w.elements('sl-rows').children.length, 1);
+      const row = w.elements('sl-rows').children[0];
+      assert.strictEqual(row._parts.name.textContent, '普通任务');
+      assert(!row._parts.name.textContent.includes('旅行信箱'));
+    });
+    w.elements('sl-travel-inbox').dispatch('click', { stopPropagation() {} });
+    await sleep(20);
+    check('旅行信箱固定展示 Claude / Codex 两个专属位置', () => {
+      assert.strictEqual(w.elements('sl-travel-mailboxes').children.length, 2);
+    });
+    check('旅行等级与本机累计等级分开计算，且不使用绿色叶片', () => {
+      assert.strictEqual(w.elements('sl-travel-rank-icons').textContent, '🐾');
+      assert.strictEqual(w.elements('sl-machine-rank-icons').textContent, '👑👑👑 ☀️☀️ 🐾');
+      assert(w.elements('sl-machine-rank-meta').textContent.includes('8.97B'));
+      assert(w.elements('sl-machine-rank-meta').textContent.includes('Claude 6.98B / Codex 1.99B'));
+      assert(!w.elements('sl-travel-rank-icons').textContent.includes('🍃'));
+      assert(!w.elements('sl-machine-rank-icons').textContent.includes('🍃'));
+    });
+    check('旧旅行按站拆成单页卡片，并生成不同地点的字符画', () => {
+      const cards = w.elements('sl-travel-stop-track').children;
+      assert.strictEqual(cards.length, 4);
+      assert(cards[0].classList.contains('active'));
+      assert(!cards[1].classList.contains('active'));
+      assert(cards[0].innerHTML.includes('珠穆朗玛峰'));
+      assert(cards[0].innerHTML.includes('^^^'));
+      assert(cards[1].innerHTML.includes('纳米布沙漠'));
+      assert(cards[1].innerHTML.includes('--'));
+      assert(cards[2].innerHTML.includes('第三站'));
+      assert(cards[3].innerHTML.includes('第四站'));
+      assert.notStrictEqual(cards[0].innerHTML, cards[1].innerHTML);
+      const arts = cards.map((card) => {
+        const match = /<pre class="sl-travel-postcard-art">([\s\S]*?)<\/pre>/.exec(card.innerHTML);
+        return match ? match[1].replace(/\s+/g, '') : '';
+      });
+      assert.strictEqual(new Set(arts).size, 4);
+      assert(cards.every((card) => card.innerHTML.length < 2300));
+    });
+    check('左右按钮切换独立站点卡片', () => {
+      assert.strictEqual(w.elements('sl-travel-stop-page').textContent, '第 1/4 站');
+      w.elements('sl-travel-stop-next').dispatch('click', { stopPropagation() {} });
+      assert.strictEqual(w.elements('sl-travel-stop-page').textContent, '第 2/4 站');
+      const cards = w.elements('sl-travel-stop-track').children;
+      assert(!cards[0].classList.contains('active'));
+      assert(cards[1].classList.contains('active'));
+    });
+    w.handlers.travel({
+      type: 'failed',
+      trip: {
+        id: 'failed-trip',
+        agent: 'claude',
+        status: 'failed',
+        error: 'Visible wander closed before returning a message.',
+        usage: { tokens: 0 },
+      },
+      state: {
+        active: null,
+        latest: {
+          id: 'failed-trip',
+          agent: 'claude',
+          status: 'failed',
+          error: 'Visible wander closed before returning a message.',
+        },
+        growth: { totalTokens: 12000, completed: 1, failed: 1, rank: { leaf: 1 } },
+        templates: [],
+      },
+    });
+    check('失败或取消的旅行不被包装成明信片', () => {
+      assert.strictEqual(w.elements('sl-travel-history').children.length, 1);
+      assert(!w.elements('sl-travel-stop-track').innerHTML.includes('Visible wander closed'));
+    });
+  }
+
+  console.log('[R14] Codex 选择对话镜像');
+  {
+    const w = world();
+    const choice = {
+      kind: 'codex-ask', requestId: 'call-r14', externalOnly: true,
+      sessionId: 'codex-session-r14', project: 'LLMPET', header: '方案',
+      question: '你要用哪一个方案？',
+      questions: [{
+        header: '方案', question: '你要用哪一个方案？',
+        options: [{ label: 'A', description: '保守' }, { label: 'B', description: '激进' }],
+      }],
+      options: [{ label: 'A', desc: '保守' }, { label: 'B', desc: '激进' }],
+      allowInput: true,
+    };
+    w.handlers.stats(baseStats({
+      needsinputCount: 1,
+      sessions: [{ sessionId: choice.sessionId, project: 'LLMPET', agent: 'codex', state: 'needsinput', choice }],
+    }));
+    check('Codex 真实问题出现在 LLMPET 问答面板', () => {
+      assert.strictEqual(w.elements('ask-q').textContent, '你要用哪一个方案？');
+      assert.strictEqual(w.elements('ask-opts').children.length, 2);
+      assert.strictEqual(w.elements('ask-term').textContent, '💬 去 Codex 选择');
+    });
+    w.elements('ask-term').dispatch('click');
+    check('点击后按 session ID 打开 Codex，不伪造 permission 回答', () => {
+      assert(w.calls.some((c) => c[0] === 'focusSession' && c[1][0] === 'codex-session-r14'));
+      assert(!w.calls.some((c) => c[0] === 'decidePermission'));
+    });
+    w.handlers.stats(baseStats({ needsinputCount: 0, sessions: [] }));
+    check('Codex 继续后选择卡从快照中消失', () => assert(w.elements('ask').classList.contains('hidden')));
   }
 
   console.log(`\n${failures === 0 ? '✅ RENDERER ALL PASS' : '❌ ' + failures + ' FAILURE(S)'}`);

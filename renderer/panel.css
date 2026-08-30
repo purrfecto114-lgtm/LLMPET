@@ -52,6 +52,12 @@ html, body {
 .stat-label { font-size: 11px; color: #c79b86; }
 .stat-value { font-size: 23px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; color: #ffcdb0; }
 .stat-foot { font-size: 10.5px; color: #a9826f; margin-top: 3px; }
+/* Claude/Codex 拆分行：比脚注再弱一档，合计仍是视觉主角。两家都有量时才有内容 */
+.stat-split { font-size: 10px; color: #8d6a58; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.stat-split:empty { display: none; }
+.stat.compact { padding: 9px 12px; }
+.stat.compact .stat-value { font-size: 18px; }
+.grid.hidden { display: none; }
 
 /* 预算条 */
 .budget { padding: 0 16px 6px; }
@@ -60,6 +66,8 @@ html, body {
 .bar { height: 8px; background: rgba(255,255,255,0.08); border-radius: 6px; overflow: hidden; }
 .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #e8a06d, #d97757); border-radius: 6px; transition: width 0.4s ease; }
 .bar-fill.warn { background: linear-gradient(90deg, #e8896b, #c9472b); }
+.bar-fill.codex { background: linear-gradient(90deg, #6aa9ff, #3b82f6); }
+.bar-fill.codex.warn { background: linear-gradient(90deg, #e8896b, #c9472b); }
 
 /* 区块 */
 .block { padding: 8px 16px; }
@@ -78,6 +86,10 @@ html, body {
 .m-item.m-total { background: rgba(217,119,87,0.16); }
 .m-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; min-width: 0; }
 .m-head .mc { color: #e9c9b8; font-size: 12px; flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Claude 与 Codex 的模型同列，靠来源小图标区分（与会话列表同款） */
+.m-agent { width: 12px; height: 12px; flex-shrink: 0; display: inline-flex; }
+.m-agent svg { width: 100%; height: 100%; }
+.m-total .m-head .mc { margin-left: 19px; }
 .m-bar { flex: 1 1 12px; height: 5px; min-width: 0; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
 .m-bar i { display: block; height: 100%; background: #d97757; border-radius: 3px; }
 .m-cost { color: #ffd8bf; font-variant-numeric: tabular-nums; flex-shrink: 0; }
@@ -108,15 +120,20 @@ html, body {
 .chart .bar.empty { background: rgba(255,255,255,0.05); }
 .chart-axis { display: flex; justify-content: space-between; font-size: 9px; color: #8c6a5a; margin-top: 3px; }
 .price-src { font-size: 9.5px; color: #8c6a5a; margin-top: 8px; }
+.usage-diagnostics {
+  font-size: 9.5px; color: #a9826f; line-height: 1.45; margin-top: 4px;
+}
 
 /* 用量趋势：视图切换 */
 .block-title { display: flex; align-items: center; justify-content: space-between; }
 .view-tabs { display: flex; gap: 3px; }
-.view-tabs .vt {
+.trend-controls { display: flex; align-items: center; gap: 5px; }
+.metric-tabs { display: flex; gap: 3px; }
+.view-tabs .vt, .metric-tabs .mt {
   font-size: 10px; padding: 3px 8px; border-radius: 7px; cursor: pointer;
   border: none; background: rgba(255,255,255,0.07); color: #c79b86; text-transform: none; letter-spacing: 0;
 }
-.view-tabs .vt.active { background: #d97757; color: #fff; }
+.view-tabs .vt.active, .metric-tabs .mt.active { background: #d97757; color: #fff; }
 .uview.hidden { display: none; }
 .readout { font-size: 10.5px; color: #c79b86; margin-top: 5px; min-height: 14px; font-variant-numeric: tabular-nums; }
 .readout b { color: #ffd8bf; }
@@ -142,7 +159,19 @@ html, body {
 
 /* 进行中的任务 */
 .row.sess { align-items: center; gap: 8px; }
+.sess-agent { width: 13px; height: 13px; flex-shrink: 0; display: inline-flex; }
+.sess-agent svg { width: 100%; height: 100%; }
 .sess-proj { color: #ffd8bf; font-size: 12px; flex-shrink: 0; }
+/* 会话 id 芯片：等宽短前缀，点一下复制完整 id（跨 session 协作） */
+.sess-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px; color: #b98a72; flex-shrink: 0;
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(217,119,87,0.22);
+  border-radius: 5px; padding: 1px 5px; cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.sess-id:hover { background: rgba(217,119,87,0.22); color: #ffd8bf; }
+.sess-id.copied { background: rgba(217,119,87,0.2); color: #ffd8bf; border-color: rgba(217,119,87,0.46); }
 .sess-op { color: #a9826f; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: auto; }
 .badge { font-size: 10px; padding: 2px 7px; border-radius: 7px; color: #fff; flex-shrink: 0; }
 .st-working { background: #2f9e52; }
@@ -184,49 +213,3 @@ html, body {
   border-radius: 6px; color: #ffd8bf; font-size: 12px; padding: 4px 6px; text-align: right;
 }
 .budget-input input:focus { outline: none; border-color: #d97757; }
-
-/* Round 8: provider toggle list */
-.provider-list { display: flex; flex-direction: column; gap: 5px; }
-.prov-item {
-  display: flex; align-items: center; gap: 8px; padding: 5px 8px;
-  border-radius: 8px; cursor: pointer; transition: background 0.15s;
-}
-.prov-item:hover { background: rgba(255,255,255,0.06); }
-.prov-item.active { background: rgba(217,119,87,0.15); }
-.prov-item.locked { opacity: 0.7; cursor: default; }
-.prov-item input[type="checkbox"] {
-  appearance: none; -webkit-appearance: none;
-  width: 16px; height: 16px; border: 2px solid #c79b86; border-radius: 4px;
-  background: transparent; cursor: pointer; flex-shrink: 0; position: relative;
-}
-.prov-item input[type="checkbox"]:checked { background: #d97757; border-color: #d97757; }
-.prov-item input[type="checkbox"]:checked::after {
-  content: '✓'; position: absolute; top: -1px; left: 2px;
-  font-size: 11px; color: #fff; font-weight: bold;
-}
-.prov-item input[type="checkbox"]:disabled { cursor: default; }
-.prov-icon { font-size: 16px; }
-.prov-label { font-size: 12px; color: #f3e7df; }
-/* Round 9-b: hook registration status indicator */
-.prov-status {
-  margin-left: auto; font-size: 10px; padding: 1px 6px; border-radius: 8px;
-  white-space: nowrap; flex-shrink: 0;
-}
-.prov-status.ok { color: #7fd1a3; background: rgba(127,209,163,0.12); }
-.prov-status.warn { color: #f0c674; background: rgba(240,198,116,0.12); }
-.prov-status.off { color: #8a807a; background: rgba(138,128,122,0.10); }
-
-/* Round 12-拓展: per-provider cost breakdown */
-.pcost-row { flex-wrap: wrap; gap: 4px 8px; align-items: center; }
-.pcost-name { font-size: 12px; color: #e9c9b8; flex-shrink: 0; min-width: 0; }
-.pcost-bar-wrap {
-  flex: 1 1 40px; height: 6px; min-width: 0;
-  background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden;
-}
-.pcost-bar {
-  display: block; height: 100%; border-radius: 3px;
-  background: linear-gradient(90deg, #e8a06d, #d97757);
-  transition: width 0.4s ease;
-}
-.pcost-row b { font-size: 12px; flex-shrink: 0; }
-.pcost-sub { font-size: 10px; color: #a9826f; margin-left: auto; flex-shrink: 0; }
