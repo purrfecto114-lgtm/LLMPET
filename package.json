@@ -4,7 +4,10 @@
   "description": "桌面宠物：实时呈现 Claude Code、OpenAI Codex 与 DeepSeek Harness 的状态、消息和会话",
   "main": "main.js",
   "license": "MIT",
-  "author": "myunwang",
+  "author": {
+    "name": "myunwang",
+    "email": "myunwang@users.noreply.github.com"
+  },
   "scripts": {
     "start": "electron .",
     "install:hooks": "node backend/hookinstall.js",
