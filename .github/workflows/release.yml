@@ -153,6 +153,10 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [build-macos, build-windows, build-linux]
+    # needs 里有 skipped 任务时，下游默认也会被跳过 —— 必须用 !cancelled()
+    # 显式放行，再逐一检查各构建结果：Windows/Linux 必须成功；macOS 允许
+    # skipped（未配置 Apple 凭证的 fork）或成功（配置了凭证的三平台齐全）。
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
