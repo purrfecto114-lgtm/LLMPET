@@ -9,12 +9,32 @@ permissions:
   contents: write
 
 jobs:
+  release-gate:
+    name: Detect Apple signing credentials
+    runs-on: ubuntu-latest
+    outputs:
+      has-apple-creds: ${{ steps.detect.outputs.has }}
+    steps:
+      # secrets 只能在 step 环境里读（job 级 if 不支持 secrets 上下文），
+      # 用一个轻量 gate job 把检测结果变成 output。
+      - id: detect
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+        run: |
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_DEVELOPER_ID_P12_BASE64" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-macos:
     name: Build macOS ARM64
     # macOS 公开发布 fail-closed 是设计约束（无凭证绝不产出未签名包）。
-    # fork 没有 Apple 签名凭证时跳过本 job（skipped 对 needs 等价于通过），
-    # Windows/Linux 产物照常发布；配置了凭证的仓库行为不变。
-    if: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 != '' && secrets.APPLE_ID != '' }}
+    # fork 没配 Apple 签名凭证时跳过本 job（skipped 对 needs 等价于通过），
+    # Windows/Linux 产物照常发布；配置了凭证的仓库行为不变（三平台齐全）。
+    needs: release-gate
+    if: needs.release-gate.outputs.has-apple-creds == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

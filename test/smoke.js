@@ -40,7 +40,7 @@ function postAbortable(pathName, body, options = {}) {
     const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
     if (authenticated && pathName === '/state') headers['x-octopus-token'] = server.getToken();
     req = http.request(
-      { hostname: '127.0.0.1', port: server.getPort(), path: requestPath, method: 'POST', headers },
+      { hostname: '127.0.0.1', port: server.getPort(), path: requestPath, method: 'POST', headers, agent: NO_KEEPALIVE },
       (res) => {
         let data = '';
         res.on('data', (c) => (data += c));
@@ -59,7 +59,7 @@ function post(pathName, body, options) {
 
 function get(pathName) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ hostname: '127.0.0.1', port: server.getPort(), path: pathName }, (res) => {
+    const req = http.get({ hostname: '127.0.0.1', port: server.getPort(), path: pathName, agent: NO_KEEPALIVE }, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
@@ -70,6 +70,12 @@ function get(pathName) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SID = 'test-session-aaaa';
+// ⚠️ 必须显式关闭 keepAlive：Node 19+ 的全局 agent 默认 keepAlive:true，
+// 会复用池化 socket。慢 CI 机器上两轮纯函数断言之间能停顿数秒，累计空闲
+// 超过 server 的 keepAliveTimeout（5s）后服务端已关掉该连接，下一个请求
+// 复用死 socket → read ECONNRESET（CI 实测：04 秒停顿后复现）。keepAlive:
+// false 让每个请求自带新鲜连接，无 socket 可腐化。
+const NO_KEEPALIVE = new http.Agent({ keepAlive: false });
 let failures = 0;
 function check(name, fn) {
   try { fn(); console.log('  ✓', name); }

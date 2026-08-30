@@ -75,6 +75,9 @@ function waitForPort(ms = 3000) {
 function request(port, method, reqPath, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
+    // keepAlive:false —— Node 19+ 全局 agent 默认复用池化 socket，慢 CI 机器上
+    // 累计空闲超过 server keepAliveTimeout（5s）后下一个请求会拿到死 socket
+    // → read ECONNRESET（smoke.js 同款防护，CI 实测复现过）。
     const req = http.request({
       hostname: '127.0.0.1', port, path: reqPath, method,
       headers: {
@@ -82,6 +85,7 @@ function request(port, method, reqPath, body, headers = {}) {
         ...headers,
       },
       timeout: 8000,
+      agent: new http.Agent({ keepAlive: false }),
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
