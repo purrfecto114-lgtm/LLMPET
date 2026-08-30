@@ -1,6 +1,6 @@
 {
   "name": "llmpet",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "桌面宠物：实时呈现 Claude Code、OpenAI Codex 与 DeepSeek Harness 的状态、消息和会话",
   "main": "main.js",
   "license": "MIT",
@@ -15,7 +15,8 @@
     "package:mac:dev": "LLMPET_MAC_SIGN_MODE=adhoc bash scripts/package-mac.sh",
     "verify:mac": "bash scripts/verify-mac-release.sh",
     "package:win": "electron-builder --win --publish never",
-    "test": "node test/smoke.js && node test/state-smoke.js && node test/pricing.js && node test/metering.js && node test/usage-archive.js && node test/usage-combine.js && node test/panel-render.js && node test/codex-metering.js && node test/codex-pricing.js && node test/agent-startup.js && node test/travel.js && node test/session-preferences.js && node test/session-handoff.js && node test/session-archive.js && node test/program-registry.js && node test/program-skill.js && node test/runtime-monitor.js && node test/territory.js && node test/codex-watch.js && node test/codex-integration.js && node test/zstd.js && node test/dsh-watch.js && node test/meme-actions.js && node test/i18n.js && node test/pet-drag-trace.js && node test/pet-geometry.js && node test/cat-retina.js && node test/popup-style.js && node test/branding.js && node test/command-safety.js && node test/runtime-ownership.js && node test/lockfile-hygiene.js && node test/pr3-smoke.js && node test/e2e-codewhale.js && node test/mac-release.js && node test/gui-defects.js"
+    "test": "node test/smoke.js && node test/state-smoke.js && node test/pricing.js && node test/metering.js && node test/usage-archive.js && node test/usage-combine.js && node test/panel-render.js && node test/codex-metering.js && node test/codex-pricing.js && node test/agent-startup.js && node test/travel.js && node test/session-preferences.js && node test/session-handoff.js && node test/session-archive.js && node test/program-registry.js && node test/program-skill.js && node test/runtime-monitor.js && node test/territory.js && node test/codex-watch.js && node test/codex-integration.js && node test/zstd.js && node test/dsh-watch.js && node test/meme-actions.js && node test/i18n.js && node test/pet-drag-trace.js && node test/pet-geometry.js && node test/cat-retina.js && node test/popup-style.js && node test/branding.js && node test/command-safety.js && node test/runtime-ownership.js && node test/lockfile-hygiene.js && node test/pr3-smoke.js && node test/e2e-codewhale.js && node test/mac-release.js && node test/gui-defects.js",
+    "package:linux": "electron-builder --linux --publish never"
   },
   "devDependencies": {
     "@electron/notarize": "2.5.0",
@@ -50,6 +51,15 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets/icon-256.png",
+      "artifactName": "LLMPET-${version}-Linux-${arch}.${ext}",
+      "category": "Utility"
     }
   }
 }

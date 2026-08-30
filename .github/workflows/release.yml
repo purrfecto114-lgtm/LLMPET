@@ -11,6 +11,10 @@ permissions:
 jobs:
   build-macos:
     name: Build macOS ARM64
+    # macOS 公开发布 fail-closed 是设计约束（无凭证绝不产出未签名包）。
+    # fork 没有 Apple 签名凭证时跳过本 job（skipped 对 needs 等价于通过），
+    # Windows/Linux 产物照常发布；配置了凭证的仓库行为不变。
+    if: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 != '' && secrets.APPLE_ID != '' }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
